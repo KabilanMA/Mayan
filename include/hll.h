@@ -25,10 +25,10 @@
 class HyperLogLog {
 public:
     // p=14 → m=16384 registers, ~0.8% standard error
-    static constexpr int    PRECISION     = 14;
-    static constexpr int    NUM_REGISTERS = 1 << PRECISION;
+    static constexpr int PRECISION     = 14;
+    static constexpr int NUM_REGISTERS = 1 << PRECISION;
     // Alpha_m bias correction constant (asymptotic formula valid for m >= 128)
-    static constexpr double ALPHA_M       = 0.7213 / (1.0 + 1.079 / NUM_REGISTERS);
+    static constexpr double ALPHA_M = 0.7213 / (1.0 + 1.079 / NUM_REGISTERS);
 
     // ----- Construction ------------------------------------------------------
 
@@ -45,7 +45,6 @@ public:
     }
 
     // ----- Insertion ---------------------------------------------------------
-
     // Add a pre-hashed 64-bit value. Callers should hash their domain keys
     // with hll_hash() before calling this.
     void add(uint64_t hashed_value) {
@@ -64,7 +63,7 @@ public:
     double estimate() const {
         // Raw HyperLogLog estimator
         double sum = 0.0;
-        int    zeros = 0;
+        int zeros = 0;
         for (uint8_t r : regs_) {
             sum += std::ldexp(1.0, -static_cast<int>(r)); // 2^(-r)
             if (r == 0) ++zeros;

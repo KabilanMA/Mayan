@@ -1,6 +1,7 @@
 #pragma once
 #include "ast.h"
 #include "cost_model.h"
+#include "format_selector.h"
 #include <vector>
 #include <limits>
 #include <unordered_set>
@@ -94,7 +95,8 @@ public:
         // ----- Main DP loop: process subsets by increasing size ---------------
         for (int size = 2; size <= N; ++size) {
             for (int mask = 1; mask < num_subsets; ++mask) {
-                if (__builtin_popcount(mask) != size) continue;
+                if (__builtin_popcount(mask) != size) 
+                    continue;
 
                 // Gather operands present in this subset
                 std::vector<std::shared_ptr<ExprNode>> subset_ops;
@@ -104,8 +106,7 @@ public:
                 }
 
                 // Determine which indices this subset must output
-                const std::vector<Index> subset_out = CostModel::infer_output_indices(
-                    subset_ops, inputs, global_out_indices);
+                const std::vector<Index> subset_out = CostModel::infer_output_indices(subset_ops, inputs, global_out_indices);
 
                 // ============================================================
                 // Strategy A: N-ary Fusion
@@ -127,7 +128,12 @@ public:
         }
 
         assert(dp[num_subsets - 1].is_valid());
-        return dp[num_subsets - 1].best_ast;
+
+        // ── Post-pass: rewrite every leaf TensorNode in the winning AST
+        //    to carry the format recommended by its consuming kernel's loop order.
+        //    This makes to_string() display the correct physical index order
+        //    and enables code-gen to emit the right COO → CSF sort order.
+        return apply_recommended_formats(dp[num_subsets - 1].best_ast);
     }
 
 private:
@@ -306,4 +312,79 @@ private:
             eval.loop_order,
             eval.out_format);
     }
-};
+
+    // =========================================================================
+    // Post-pass: apply_recommended_formats
+    //
+    // Walks the final AST produced by the DP and rewrites every TensorNode
+    // leaf to use the storage format recommended by its parent kernel's
+    // loop_iteration_order. This is what causes:
+    //
+    //   SpGEMM:  B(i,k) declared in COO  →  B(i,k):[i(C),k(C)]  [CSR]
+    //            C(k,j) declared in COO  →  C(j,k):[j(C),k(C)]  [CSC]
+    //
+    // when printed with to_string().
+    //
+    // Design: we never mutate shared_ptrs from the DP table (multiple DP
+    // states may reference the same node). Instead we copy-on-write: any
+    // TensorNode or FusedContractionNode that needs updating gets a fresh
+    // allocation. Nodes that are already correct are returned as-is.
+    // =========================================================================
+    static std::shared_ptr<ExprNode> apply_recommended_formats(
+        const std::shared_ptr<ExprNode>& node,
+        const std::unordered_map<Index, int>& dim_sizes = {})
+    {
+        // Leaf: format will be set when we process it in the context of its
+        // parent kernel. Return unchanged here — the parent handles it.
+        if (std::dynamic_pointer_cast<TensorNode>(node)) {
+            return node;
+        }
+
+        auto fused = std::dynamic_pointer_cast<FusedContractionNode>(node);
+        if (!fused) return node; // unknown node type; pass through
+
+        // Recursively rewrite each operand, then apply format to TensorNode leaves
+        std::vector<std::shared_ptr<ExprNode>> new_operands;
+        new_operands.reserve(fused->operands.size());
+        bool any_changed = false;
+
+        for (const auto& op : fused->operands) {
+            if (auto t = std::dynamic_pointer_cast<TensorNode>(op)) {
+                // Recommend the format this leaf needs for the current kernel
+                auto rec = FormatSelector::recommend_for(
+                    *t, fused->loop_iteration_order, dim_sizes);
+
+                if (FormatSelector::needs_reformat(*t, rec.format.mode_order) ||
+                    t->format_label != rec.label)
+                {
+                    // Copy-on-write: create a new TensorNode with updated format
+                    auto new_t = std::make_shared<TensorNode>(*t);
+                    new_t->format       = rec.format;
+                    new_t->format_label = rec.label;
+                    new_t->rationale    = rec.rationale;
+                    new_operands.push_back(new_t);
+                    any_changed = true;
+                } else {
+                    new_operands.push_back(op);
+                }
+            } else {
+                // Recurse into sub-trees (intermediates from binary splits
+                // or pivot decomposition)
+                auto rewritten = apply_recommended_formats(op, dim_sizes);
+                if (rewritten != op) any_changed = true;
+                new_operands.push_back(rewritten);
+            }
+        }
+
+        if (!any_changed) return node;
+
+        // Return an updated FusedContractionNode referencing the rewritten operands
+        return std::make_shared<FusedContractionNode>(
+            std::move(new_operands),
+            fused->out_indices,
+            fused->cached_nnz,
+            fused->loop_iteration_order,
+            fused->output_format);
+    }
+
+}; // class DPOptimizer

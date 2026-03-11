@@ -1,6 +1,7 @@
 #pragma once
 #include "ast.h"
 #include "hll.h"
+#include "format_selector.h"
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
@@ -9,13 +10,12 @@
 #include <memory>
 #include <cmath>
 #include <numeric>
+#include <functional>
 
-// =============================================================================
-// IndexRole — classifies each loop index for this kernel
-//
-//   FREE        : appears in the output; forms the outer loop nest
-//   CONTRACTED  : summed over; forms the inner loop nest; not in the output
-// =============================================================================
+
+// FREE: appears in the output; forms the outer loop nest
+// CONTRACTED: summed over; forms the inner loop nest; not in the output
+// classifies each loop index for this kernel
 enum class IndexRole { FREE, CONTRACTED };
 
 struct IndexClassification {
@@ -23,64 +23,87 @@ struct IndexClassification {
     std::vector<Index> contracted_indices;  // eliminated by this kernel
 };
 
-// =============================================================================
+// NnzEstimationMode - records which path estimate_output_nnz actually took.
+// Stored in KernelCostBreakdown so callers can inspect / log the decision.
+enum class NnzEstimationMode {
+    // No contracted indices exist → pure Cartesian product of all operand NNZs.
+    // Formula: Π NNZ(operand_i)
+    OUTER_PRODUCT,
+
+    // All operands form a single connected component in the contraction graph
+    // (every operand shares at least one contracted index with at least one other).
+    // HLL intersection is applied across all operands.
+    HLL_SINGLE_COMPONENT,
+
+    // The contraction graph has ≥2 connected components. HLL intersection is
+    // applied within each component; results are multiplied across components
+    // (Cartesian product between disconnected sub-expressions).
+    HLL_MULTI_COMPONENT,
+
+    // Not all operands carry HLL sketches -> fell back to density × output_volume.
+    DENSITY_PRODUCT_FALLBACK,
+};
+
 // KernelCostBreakdown — detailed cost components returned to the DP
-// =============================================================================
 struct KernelCostBreakdown {
     double compute_cost      = 0.0;  // FLOPs proxy: Σ NNZ of operands × divergence factor
     double access_penalty    = 0.0;  // CSF discordant-access penalty (depth-scaled)
     double memory_write_cost = 0.0;  // HBM write cost for output materialization
     double total_cost        = 0.0;
+    NnzEstimationMode nnz_mode = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
 };
 
-// =============================================================================
 // FusedCostResult — everything the DP needs to know about a proposed fusion
-// =============================================================================
 struct FusedCostResult {
-    double                total_cost;
-    double                estimated_out_nnz;
-    std::vector<Index>    loop_order;     // full loop nest: free first, contracted inner
-    StorageFormat         out_format;
-    KernelCostBreakdown   breakdown;      // for debugging / tuning
+    double total_cost;
+    double estimated_out_nnz;
+    std::vector<Index> loop_order;     // full loop nest: free first, contracted inner
+    StorageFormat out_format;
+    KernelCostBreakdown breakdown;      // for debugging / tuning
+
+    // One entry per operand, same order as the operands vector passed in.
+    // For TensorNode leaves: gives the CSR/CSC/CSF recommendation plus
+    //   the COO re-sort cost absorbed into total_cost.
+    // For FusedContractionNode intermediates: reflects the existing output format.
+    std::vector<InputFormatRecommendation> input_formats;
 };
 
-// =============================================================================
-// CostModel
-//
-// Three responsibilities:
-//   1. Index classification  — which indices are free vs. contracted
-//   2. NNZ estimation        — uses HLL sketches when available
-//   3. Kernel cost scoring   — compute + access + write costs
-// =============================================================================
+/**
+ * @class CostModel
+ * @brief Calculate the cost for different optimization and fusion for the kernel
+ * Three responsibilities:
+ *      1. Index classification  — which indices are free vs. contracted.
+ *      2. NNZ estimation        — uses HLL sketches when available.
+ *      3. Kernel cost scoring   — compute + access + write costs.
+ */
 class CostModel {
 public:
-    // -------------------------------------------------------------------------
-    // Evaluate the total cost of fusing a subset of operands into one kernel.
-    //
-    //   operands        : the ExprNodes being fused (TensorNode or FusedContractionNode)
-    //   output_indices  : indices that must survive this contraction
-    //   dim_sizes       : dimension sizes keyed by Index (for sparsity calculation)
-    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Evaluate the total cost of fusing a subset of operands into one kernel.
+     * 
+     * @param operands the ExprNodes being fused (TensorNode or FusedContractionNode)
+     * @param output_indices indices that must survive this contraction
+     * @param dim_sizes dimension sizes keyed by Index (for sparsity calculation)
+     * 
+     * @return The cost information for the proposed fusion
+     */
     static FusedCostResult evaluate_fused(
         const std::vector<std::shared_ptr<ExprNode>>& operands,
         const std::vector<Index>& output_indices,
         const std::unordered_map<Index, int>& dim_sizes = {})
     {
         if (operands.empty()) {
-            return {0.0, 0.0, {}, {}, {}};
+            return {0.0, 0.0, {}, {}, {}, {}};
         }
 
-        // ------------------------------------------------------------------
-        // Step 1: Classify indices as FREE (outer loops) vs CONTRACTED (inner)
-        // ------------------------------------------------------------------
+        // Classify indices as FREE (outer loops) vs CONTRACTED (inner)
         const IndexClassification idx_class = classify_indices(operands, output_indices);
 
-        // ------------------------------------------------------------------
-        // Step 2: Estimate output NNZ using HLL sketches when available,
-        //         otherwise fall back to the density-product heuristic.
-        // ------------------------------------------------------------------
-        const double estimated_out_nnz = estimate_output_nnz(
-            operands, output_indices, idx_class, dim_sizes);
+        // Estimate output NNZ using HLL sketches when available, 
+        // otherwise fall back to the density-product heuristic.
+        NnzEstimationMode nnz_mode = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
+        const double estimated_out_nnz = estimate_output_nnz(operands, output_indices, idx_class, dim_sizes, nnz_mode);
 
         // ------------------------------------------------------------------
         // Step 3: Determine loop order.
@@ -90,8 +113,7 @@ public:
         //         Phase B — contracted indices innermost, ordered by
         //                   concordance to keep inner loops sequential.
         // ------------------------------------------------------------------
-        const std::vector<Index> loop_order = determine_loop_order(
-            operands, idx_class);
+        const std::vector<Index> loop_order = determine_loop_order(operands, idx_class);
 
         // ------------------------------------------------------------------
         // Step 4: Choose the output CSF storage format.
@@ -99,17 +121,39 @@ public:
         //         concordant writes (no post-transpose needed for the next
         //         DP stage).
         // ------------------------------------------------------------------
-        const StorageFormat out_format = choose_output_format(
-            loop_order, output_indices, estimated_out_nnz, dim_sizes);
+        const StorageFormat out_format = choose_output_format(loop_order, output_indices, estimated_out_nnz, dim_sizes);
 
         // ------------------------------------------------------------------
         // Step 5: Score the kernel
         // ------------------------------------------------------------------
-        const KernelCostBreakdown breakdown = score_kernel(
-            operands, loop_order, estimated_out_nnz);
+        KernelCostBreakdown breakdown = score_kernel(operands, loop_order, estimated_out_nnz);
+        breakdown.nnz_mode = nnz_mode;
 
-        return {breakdown.total_cost, estimated_out_nnz,
-                loop_order, out_format, breakdown};
+        // ------------------------------------------------------------------
+        // Step 6: Recommend input formats (CSR / CSC / CSF) and account for
+        //         COO → CSF conversion cost.
+        //
+        //         Conversion cost is a one-time sort: NNZ × log(NNZ).
+        //         It is included in total_cost so the DP can correctly prefer
+        //         a plan where inputs need no re-sorting over one that is
+        //         cheaper to execute but requires expensive COO conversion.
+        // ------------------------------------------------------------------
+        std::vector<InputFormatRecommendation> input_formats = FormatSelector::recommend_all(operands, loop_order, dim_sizes);
+
+        double coo_conversion_cost = 0.0;
+        for (size_t i = 0; i < operands.size(); ++i) {
+            if (auto t = std::dynamic_pointer_cast<TensorNode>(operands[i])) {
+                // Only pay conversion cost if the recommended format differs
+                // from the tensor's current physical layout
+                if (FormatSelector::needs_reformat(*t, input_formats[i].format.mode_order)) {
+                    coo_conversion_cost += FormatSelector::conversion_cost(*t);
+                }
+            }
+        }
+
+        const double total_cost = breakdown.total_cost + coo_conversion_cost;
+
+        return {total_cost, estimated_out_nnz, loop_order, out_format, breakdown, std::move(input_formats)};
     }
 
     // -------------------------------------------------------------------------
@@ -127,9 +171,8 @@ public:
     static std::vector<Index> infer_output_indices(
         const std::vector<std::shared_ptr<ExprNode>>& subset_operands,
         const std::vector<std::shared_ptr<ExprNode>>& all_operands,
-        const std::vector<Index>& global_out_indices) 
+        const std::vector<Index>& global_out_indices)
     {
-
         std::unordered_set<Index> subset_idx;
         std::unordered_set<Index> remaining_idx;
         const std::unordered_set<Index> global_out(global_out_indices.begin(), global_out_indices.end());
@@ -172,19 +215,24 @@ public:
         return output;
     }
 
-    // -------------------------------------------------------------------------
-    // Classify all indices appearing in `operands` into FREE vs CONTRACTED.
-    // -------------------------------------------------------------------------
+    /**
+     * @brief Classify all indices appearing in `operands` into FREE vs CONTRACTED.
+     * 
+     * @param operands Tensors to consider for the contraction.
+     * @param output_indices 
+     * 
+     * @return vectors of free and contracted indices
+     */
     static IndexClassification classify_indices(
         const std::vector<std::shared_ptr<ExprNode>>& operands,
-        const std::vector<Index>&                      output_indices)
+        const std::vector<Index>& output_indices)
     {
-        const std::unordered_set<Index> out_set(
-            output_indices.begin(), output_indices.end());
+        const std::unordered_set<Index> out_set(output_indices.begin(), output_indices.end());
 
         std::unordered_set<Index> all_set;
         for (const auto& op : operands) {
-            for (Index idx : op->get_indices()) all_set.insert(idx);
+            for (Index idx : op->get_indices()) 
+                all_set.insert(idx);
         }
 
         IndexClassification result;
@@ -197,7 +245,7 @@ public:
         }
 
         // Stable canonical order for reproducibility
-        std::sort(result.free_indices.begin(),       result.free_indices.end());
+        std::sort(result.free_indices.begin(), result.free_indices.end());
         std::sort(result.contracted_indices.begin(), result.contracted_indices.end());
         return result;
     }
@@ -210,38 +258,103 @@ private:
     // Estimate the number of non-zeros in the output of this kernel.
     //
     // Strategy:
-    //  (a) If ALL operands carry non-empty HLL sketches, use the set-theoretic
-    //      intersection estimate on the CONTRACTED dimensions. The output NNZ
-    //      is then the intersection cardinality projected onto free dimensions.
+    //  (a) If ALL operands carry non-empty HLL sketches, delegate to
+    //      estimate_nnz_via_hll which applies connected-component analysis
+    //      to pick the right formula per case (see NnzEstimationMode).
     //  (b) Otherwise, fall back to a density-product heuristic:
     //        density(output) ≈ Π density(operand_i)
     //        output_volume   = Π dim_size(free_index_j)
     //        estimated_nnz   = density(output) × output_volume
     //
+    /**
+     * @brief Estimate the number of non-zeros in the output of this kernel.
+     * 
+     * Strategy:
+     * 
+     * (a) If ALL operands carry non-empty HLL sketches, delegate to
+     *      estimate_nnz_via_hll which applies connected-component anal
+     *      to pick the right formula per case (see NnzEstimationMode).
+     * 
+     * (b) Otherwise, fall back to a density-product heuristic:
+     * 
+     *      - density(output) ≈ Π density(operand_i)
+     * 
+     *      - output_volume   = Π dim_size(free_index_j)
+     * 
+     *      - estimated_nnz   = density(output) × output_volume
+     */
     static double estimate_output_nnz(
         const std::vector<std::shared_ptr<ExprNode>>& operands,
-        const std::vector<Index>&                      output_indices,
-        const IndexClassification&                     idx_class,
-        const std::unordered_map<Index, int>&          dim_sizes)
+        const std::vector<Index>& output_indices,
+        const IndexClassification& idx_class,
+        const std::unordered_map<Index, int>& dim_sizes,
+        NnzEstimationMode& mode_out)
     {
         // Attempt HLL path
         if (all_have_hll_sketches(operands)) {
-            return estimate_nnz_via_hll(operands, output_indices, idx_class, dim_sizes);
+            return estimate_nnz_via_hll(operands, idx_class, mode_out);
         }
+        mode_out = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
         // Fallback density-product path
         return estimate_nnz_density_product(operands, output_indices, dim_sizes);
     }
 
-    static bool all_have_hll_sketches(
-        const std::vector<std::shared_ptr<ExprNode>>& operands)
+    static bool all_have_hll_sketches(const std::vector<std::shared_ptr<ExprNode>>& operands)
     {
         for (const auto& op : operands) {
-            if (op->metadata.hll_sketch.empty()) return false;
+            if (op->metadata.hll_sketch.empty()) 
+                return false;
         }
         return true;
     }
 
-    // HLL-based estimation:
+        // =========================================================================
+    // estimate_nnz_via_hll — the corrected HLL path
+    //
+    // WHY THE OLD CODE WAS WRONG
+    // ──────────────────────────
+    // Each tensor's HLL sketch hashes its *full coordinate tuple*.
+    // B(i,k) hashes (i,k) pairs  →  lives in coordinate space ℤᵢ × ℤₖ
+    // C(k,j) hashes (k,j) pairs  →  lives in coordinate space ℤₖ × ℤⱼ
+    //
+    // Calling estimate_intersection(B_sketch, C_sketch) computes |B ∩ C| in
+    // the *hash* space.  Because B and C live in DIFFERENT coordinate spaces,
+    // this intersection has no mathematical meaning — it returns a small number
+    // by random hash collision, not by actual sparsity structure.
+    //
+    // THE THREE CASES AND THEIR CORRECT FORMULAS
+    // ──────────────────────────────────────────
+    //
+    // Case 1 — No contracted indices (pure outer product):
+    //   A(i,j) ⊗ B(k,l) → C(i,j,k,l)
+    //   Every NNZ of A paired with every NNZ of B produces a NNZ in C.
+    //   Output NNZ = Π NNZ(operandᵢ)
+    //   Intersection is completely wrong here.
+    //
+    // Case 2 — Single connected component:
+    //   B(i,k) * C(k,j) → A(i,j)   [k is contracted, connects B and C]
+    //   Both operands share contracted index k.  Their sketches are built
+    //   over the same k-coordinate domain, making intersection a reasonable
+    //   proxy.  We apply HLL intersection to the whole group.
+    //
+    // Case 3 — Multiple connected components:
+    //   A(i,j) * B(k,l) * C(j,k) → D(i,l)
+    //   Contraction graph: A──C──B (j connects A-C, k connects C-B).
+    //   A, B, C are all connected → single component here.
+    //   But consider: A(i,j) * B(j,k) * C(l,m) → D(i,k,l,m)
+    //   Graph: A──B   C  (C is isolated; j is contracted, l and m are free)
+    //   Component 1: {A, B} → intersection estimate
+    //   Component 2: {C}    → C's own NNZ
+    //   Output NNZ = NNZ(A*B) × NNZ(C)   [Cartesian product across components]
+    //
+    // BUILDING THE CONTRACTION GRAPH
+    // ──────────────────────────────
+    // Nodes  = operands (indices 0..N-1)
+    // Edge(i,j) iff operands i and j share ≥1 contracted index.
+    // Connected components are found via union-find.
+    // =========================================================================
+    /**
+     * @brief     // HLL-based estimation:
     // The expected output NNZ = intersection_cardinality(contracted dims) ×
     //                           product_of_free_dim_densities
     //
@@ -250,30 +363,98 @@ private:
     //
     // The n-way intersection of the HLL sketches gives a sharper lower-bound
     // than the raw min() used in earlier versions.
+     */
     static double estimate_nnz_via_hll(
         const std::vector<std::shared_ptr<ExprNode>>& operands,
-        const std::vector<Index>&                      /*output_indices*/,
-        const IndexClassification&                     /*idx_class*/,
-        const std::unordered_map<Index, int>&          /*dim_sizes*/)
+        const IndexClassification& idx_class,
+        NnzEstimationMode& mode_out)
     {
-        // Reconstruct HLL sketches from metadata
-        std::vector<HyperLogLog> sketches;
-        sketches.reserve(operands.size());
-        for (const auto& op : operands) {
-            sketches.emplace_back(op->metadata.hll_sketch);
+        const int N = static_cast<int>(operands.size());
+
+        // ── Case 1: no contracted indices -> pure outer product ─────────────────
+        if (idx_class.contracted_indices.empty()) {
+            mode_out = NnzEstimationMode::OUTER_PRODUCT;
+            double product = 1.0;
+            for (const auto& op : operands) product *= op->estimate_nnz();
+            return std::max(1.0, product);
         }
 
-        // Build pointer list for n-way intersection
-        std::vector<const HyperLogLog*> sketch_ptrs;
-        sketch_ptrs.reserve(sketches.size());
-        for (const auto& s : sketches) sketch_ptrs.push_back(&s);
+        // ── Build contraction graph ────────────────────────────────────────────
+        // For each operand, collect which contracted indices it owns.
+        const std::unordered_set<Index> contracted_set(
+            idx_class.contracted_indices.begin(),
+            idx_class.contracted_indices.end());
 
-        // N-way intersection gives the expected number of coordinate tuples
-        // that survive the join — a tight upper bound on output NNZ.
-        const double intersection_est =
-            HyperLogLog::estimate_intersection(sketch_ptrs);
+        std::vector<std::unordered_set<Index>> op_contracted(N);
+        for (int i = 0; i < N; ++i) {
+            for (Index idx : operands[i]->get_indices()) {
+                if (contracted_set.count(idx)) op_contracted[i].insert(idx);
+            }
+        }
 
-        return std::max(1.0, intersection_est);
+        // Union-find
+        std::vector<int> parent(N);
+        std::iota(parent.begin(), parent.end(), 0);
+        std::function<int(int)> find = [&](int x) -> int {
+            return parent[x] == x ? x : parent[x] = find(parent[x]);
+        };
+        auto unite = [&](int a, int b) {
+            a = find(a); b = find(b);
+            if (a != b) parent[a] = b;
+        };
+
+        // Connect operands that share a contracted index.
+        // NOTE: operands that are only connected through FREE indices are NOT
+        // joined here — free indices don't create a join dependency; they just
+        // mean both tensors are iterated over in the same outer loop.
+        for (int i = 0; i < N; ++i) {
+            for (int j = i + 1; j < N; ++j) {
+                for (Index idx : op_contracted[i]) {
+                    if (op_contracted[j].count(idx)) { unite(i, j); break; }
+                }
+            }
+        }
+
+        // Group operands by component root
+        std::unordered_map<int, std::vector<int>> components;
+        for (int i = 0; i < N; ++i) components[find(i)].push_back(i);
+
+        // ── Reconstruct sketches ───────────────────────────────────────────────
+        std::vector<HyperLogLog> sketches;
+        sketches.reserve(N);
+        for (const auto& op : operands) sketches.emplace_back(op->metadata.hll_sketch);
+
+        // ── Compute NNZ per component, multiply across components ──────────────
+        //
+        // Within a component: HLL intersection is valid because all operands
+        // share at least one contracted index — their coordinate spaces overlap
+        // in the k-dimension, making the intersection a useful order-of-magnitude
+        // proxy for the number of matching k-values.
+        //
+        // Across components: pure Cartesian product (different index spaces).
+        double total_nnz = 1.0;
+
+        for (const auto& [root, members] : components) {
+            double component_nnz;
+            if (static_cast<int>(members.size()) == 1) {
+                // Isolated operand: no contracted index shared with anyone else.
+                // Its full NNZ is its contribution to the outer product.
+                component_nnz = sketches[members[0]].estimate();
+            } else {
+                // Connected component: intersection estimate
+                std::vector<const HyperLogLog*> ptrs;
+                ptrs.reserve(members.size());
+                for (int idx : members) ptrs.push_back(&sketches[idx]);
+                component_nnz = HyperLogLog::estimate_intersection(ptrs);
+            }
+            total_nnz *= std::max(1.0, component_nnz);
+        }
+
+        mode_out = (components.size() == 1)
+            ? NnzEstimationMode::HLL_SINGLE_COMPONENT
+            : NnzEstimationMode::HLL_MULTI_COMPONENT;
+
+        return std::max(1.0, total_nnz);
     }
 
     // Density-product fallback:
