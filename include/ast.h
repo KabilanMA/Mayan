@@ -52,14 +52,32 @@ struct SparseMetadata {
     // HyperLogLog sketch for cardinality estimation (see hll.h).
     // Empty -> cost model falls back to density-product heuristic.
     std::vector<uint8_t> hll_sketch;
+
+    // Per-mode HLL sketches: mode_sketches['k'] hashes only the k-coordinate
+    // of each non-zero, ignoring all other dimensions.
+    //
+    // Why this is needed:
+    //   When index k appears in only one tensor (a "private contracted" index),
+    //   that tensor self-reduces along k before any inter-tensor join.
+    //   e.g. B(j,k) with k private →  B'(j) = Σ_k B(j,k)
+    //   The NNZ of B' is the number of UNIQUE j values in B, not NNZ(B).
+    //   mode_sketches['j'] estimates that projected cardinality directly,
+    //   without materialising B'.
+    //
+    // Populated at COO load time alongside hll_sketch (one pass over the data).
+    std::unordered_map<Index, std::vector<uint8_t>> mode_sketches;
+
+    // KMV counterparts to handle Multi-Way Joins natively
+    std::vector<uint64_t> kmv_sketch;
+    std::unordered_map<Index, std::vector<uint64_t>> mode_kmv_sketches;
 };
 
 // Base AST Node
 struct ExprNode {
     virtual ~ExprNode() = default;
     virtual std::vector<Index> get_indices() const = 0;
-    virtual double estimate_nnz()  const = 0;
-    virtual std::string to_string()     const = 0;
+    virtual double estimate_nnz() const = 0;
+    virtual std::string to_string() const = 0;
     SparseMetadata metadata;
 };
 
@@ -67,7 +85,7 @@ struct ExprNode {
 //
 // `indices`      : the LOGICAL indices in the original einsum notation.
 //                  e.g. B(i,k) → indices = {'i','k'}
-//                  These never change; they describe the mathematical role.
+//                  These never change; they describe the mathematical role
 //
 // `format`       : the PHYSICAL storage layout.
 //                  format.mode_order is the actual memory order of the tensor.
@@ -83,13 +101,13 @@ struct ExprNode {
 //                  Empty before optimization.
 // ─────────────────────────────────────────────────────────────────────────────
 struct TensorNode : public ExprNode {
-    std::string        name;
+    std::string name;
     std::vector<Index> indices;      // logical, original einsum order (immutable)
-    Shape              shape;
-    double             nnz;
-    StorageFormat      format;       // physical layout; mode_order updated by optimizer
-    std::string        format_label; // "CSR" / "CSC" / "CSF[...]" — set post-optimization
-    std::string        rationale;    // why this format — set post-optimization
+    Shape shape;
+    double nnz;
+    StorageFormat format;       // physical layout; mode_order updated by optimizer
+    std::string format_label; // "CSR" / "CSC" / "CSF[...]" — set post-optimization
+    std::string rationale;    // why this format — set post-optimization
 
     TensorNode(std::string n, std::vector<Index> idx, Shape s, double non_zeros,
                StorageFormat fmt, SparseMetadata meta = {})
@@ -166,8 +184,13 @@ struct FusedContractionNode : public ExprNode {
           cached_nnz(nnz), loop_iteration_order(std::move(loop_order)),
           output_format(std::move(out_fmt)) {}
 
-    std::vector<Index> get_indices() const override { return out_indices; }
-    double             estimate_nnz() const override { return cached_nnz; }
+    std::vector<Index> get_indices() const override { 
+        return out_indices; 
+    }
+
+    double estimate_nnz() const override { 
+        return cached_nnz; 
+    }
 
     // -------------------------------------------------------------------------
     // to_string(): shows the full kernel plan.

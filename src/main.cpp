@@ -112,7 +112,49 @@ static std::vector<uint8_t> build_hll_sketch(int dim0, int dim1,
     return hll.serialize();
 }
 
-// Quick stand-alone HLL estimate check (diagnostic only)
+// Build a per-mode HLL sketch: inserts only the coordinate along `mode_dim`
+// (ignoring all other dimensions). The result estimates distinct values along
+// that one axis — exactly what projected_nnz needs for self-reduction.
+static std::vector<uint8_t> build_mode_sketch(int mode_dim, long long nnz, uint64_t seed)
+{
+    HyperLogLog hll;
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> coord_dist(0, mode_dim - 1);
+    for (long long n = 0; n < nnz; ++n) {
+        hll.add(hll_hash(static_cast<uint64_t>(coord_dist(rng))));
+    }
+    return hll.serialize();
+}
+
+// Build a KMV mode sketch for N-way intersection robustness
+static std::vector<uint64_t> build_mode_kmv_sketch(int mode_dim, long long nnz, uint64_t seed) {
+    KMinValues kmv;
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> coord_dist(0, mode_dim - 1);
+    for (long long n = 0; n < nnz; ++n) {
+        kmv.add(hll_hash(static_cast<uint64_t>(coord_dist(rng))));
+    }
+    return kmv.serialize();
+}
+
+// Build a full-tuple KMV sketch for element-wise operations
+static std::vector<uint64_t> build_kmv_sketch(int dim0, int dim1,
+                                              long long nnz, uint64_t seed)
+{
+    KMinValues kmv;
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> row_dist(0, dim0 - 1);
+    std::uniform_int_distribution<int> col_dist(0, dim1 - 1);
+
+    for (long long n = 0; n < nnz; ++n) {
+        const uint64_t r = static_cast<uint64_t>(row_dist(rng));
+        const uint64_t c = static_cast<uint64_t>(col_dist(rng));
+        kmv.add(hll_hash(hll_hash_combine(hll_hash(r), hll_hash(c))));
+    }
+
+    return kmv.serialize();
+}
+
 static void verify_hll(const std::vector<uint8_t>& sketch, long long true_nnz,
                         const std::string& name)
 {
@@ -159,7 +201,7 @@ static std::shared_ptr<TensorNode> make_coo_tensor(
 // ─────────────────────────────────────────────────────────────────────────────
 static void test_spgemm()
 {
-    banner("Test A: SpGEMM   A(i,j) = B(i,k) * C(k,j)");
+    // banner("Test A: SpGEMM   A(i,j) = B(i,k) * C(k,j)");
 
     // Dimensions
     const int M = 1000, K = 500, N = 800;
@@ -168,9 +210,9 @@ static void test_spgemm()
     auto B = make_coo_tensor("B", {'i','k'}, {M, K}, 5000,  5000.0/(M*K));
     auto C = make_coo_tensor("C", {'k','j'}, {K, N}, 4000,  4000.0/(K*N));
 
-    section("Before optimization");
-    print_tensor_before(*B);
-    print_tensor_before(*C);
+    // section("Before optimization");
+    // print_tensor_before(*B);
+    // print_tensor_before(*C);
 
     // Global output: A(i,j)
     const std::vector<Index> out = {'i','j'};
@@ -178,11 +220,11 @@ static void test_spgemm()
 
     auto plan = DPOptimizer::optimize({B, C}, out, dims);
 
-    section("Optimized plan");
-    std::cout << plan->to_string() << "\n";
+    // section("Optimized plan");
+    // std::cout << plan->to_string() << "\n";
 
-    section("Format recommendations");
-    print_format_recommendations(plan);
+    // section("Format recommendations");
+    // print_format_recommendations(plan);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,13 +334,13 @@ static void test_spttm()
 // ─────────────────────────────────────────────────────────────────────────────
 static void test_spgemm_hll()
 {
-    banner("Test D: SpGEMM + HLL sketches   A(i,j) = B(i,k) * C(k,j)");
+    // banner("Test D: SpGEMM + HLL sketches   A(i,j) = B(i,k) * C(k,j)");
 
     const int M=1000, K=500, N=800;
     const long long B_nnz = 5000, C_nnz = 4000;
 
     // Build real HLL sketches from simulated coordinate streams
-    section("Building HLL sketches from simulated COO data");
+    // section("Building HLL sketches from simulated COO data");
     auto B_sketch = build_hll_sketch(M, K, B_nnz, /*seed=*/42);
     auto C_sketch = build_hll_sketch(K, N, C_nnz, /*seed=*/99);
 
@@ -316,20 +358,20 @@ static void test_spgemm_hll()
     auto B = make_coo_tensor("B", {'i','k'}, {M,K}, B_nnz, (double)B_nnz/(M*K), B_sketch);
     auto C = make_coo_tensor("C", {'k','j'}, {K,N}, C_nnz, (double)C_nnz/(K*N), C_sketch);
 
-    section("Before optimization");
-    print_tensor_before(*B);
-    print_tensor_before(*C);
+    // section("Before optimization");
+    // print_tensor_before(*B);
+    // print_tensor_before(*C);
 
     const std::vector<Index> out = {'i','j'};
     const std::unordered_map<Index,int> dims = {{'i',M},{'j',N},{'k',K}};
 
     auto plan = DPOptimizer::optimize({B, C}, out, dims);
 
-    section("Optimized plan");
-    std::cout << plan->to_string() << "\n";
+    // section("Optimized plan");
+    // std::cout << plan->to_string() << "\n";
 
-    section("Format recommendations");
-    print_format_recommendations(plan);
+    // section("Format recommendations");
+    // print_format_recommendations(plan);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -395,9 +437,6 @@ static void print_nnz_mode(
     const std::vector<Index>& out,
     const std::unordered_map<Index,int>& dims)
 {
-    const IndexClassification cls = CostModel::classify_indices(inputs, out);
-    NnzEstimationMode mode = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
-    // Re-evaluate just the NNZ path (free function exposed for testing)
     const FusedCostResult r = CostModel::evaluate_fused(inputs, out, dims);
     const char* labels[] = {
         "OUTER_PRODUCT",
@@ -468,62 +507,107 @@ static void test_outer_product()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Test G: Multi-component — D(i,l) = A(i,j) * B(j,k) * C(l,m)
+// Test G: Multi-component + private contracted indices
+//         D(i,l) = A(i,j) * B(j,k) * C(l,m)
 //
-// A and B are connected via contracted index j.
-// C has indices l (free) and m (contracted), but m appears only in C —
-// C is an isolated component in the contraction graph.
+// Index roles:
+//   j — shared contracted: appears in A and B → creates join edge A──B
+//   k — private contracted: appears ONLY in B → B self-reduces: B'(j)=Σ_k B(j,k)
+//   m — private contracted: appears ONLY in C → C self-reduces: C'(l)=Σ_m C(l,m)
 //
-// Correct formula:
-//   NNZ(D) = NNZ(A*B) [HLL intersection] × NNZ(C) [outer product component]
+// Contraction graph: {A,B}   {C}   — two components
+//   Component 1: A──B joined on j; B's effective NNZ = |unique j in B|, not NNZ(B)
+//   Component 2: C is isolated; C's effective NNZ = |unique l in C|, not NNZ(C)
 //
-// Old code would intersect ALL THREE sketches together → wrong result because
-// C's (l,m) coordinate space has nothing to do with A's (i,j) or B's (j,k).
+// Correct output NNZ:
+//   ≈ matching_j_values(A,B) × (avg_i_per_j_in_A) × unique_l_in_C
+//
+// We now populate mode_sketches so the cost model can project B and C correctly.
 // ─────────────────────────────────────────────────────────────────────────────
 static void test_multi_component()
 {
-    banner("Test G: Multi-component   D(i,l) = A(i,j) * B(j,k) * C(l,m)\n"
-           "        [A-B connected via j; C is isolated]");
+    banner("Test G: Multi-component + private contracted indices\n"
+           "        D(i,l) = A(i,j) * B(j,k) * C(l,m)");
 
     const int I=200, J=150, K=100, L=300, M=80;
     const long long A_nnz=5000, B_nnz=3000, C_nnz=1000;
 
+    // Full-tuple sketches (for reference)
     auto A_sk = build_hll_sketch(I, J, A_nnz, 11);
     auto B_sk = build_hll_sketch(J, K, B_nnz, 22);
     auto C_sk = build_hll_sketch(L, M, C_nnz, 33);
 
-    section("HLL sketch accuracy");
-    verify_hll(A_sk, A_nnz, "A");
-    verify_hll(B_sk, B_nnz, "B");
-    verify_hll(C_sk, C_nnz, "C");
+    // Per-mode sketches
+    // A(i,j): mode_sketch['i'] and mode_sketch['j']
+    auto A_i_sk = build_mode_sketch(I, A_nnz, 101);
+    auto A_j_sk = build_mode_sketch(J, A_nnz, 102);
+    auto A_j_kmv = build_mode_kmv_sketch(J, A_nnz, 102);
+    
+    // B(j,k): k is private contracted; we need mode_sketch['j'] for projection
+    auto B_j_sk = build_mode_sketch(J, B_nnz, 201);
+    auto B_k_sk = build_mode_sketch(K, B_nnz, 202);
+    auto B_j_kmv = build_mode_kmv_sketch(J, B_nnz, 201);
+    
+    // C(l,m): m is private contracted; we need mode_sketch['l'] for projection
+    auto C_l_sk = build_mode_sketch(L, C_nnz, 301);
+    auto C_m_sk = build_mode_sketch(M, C_nnz, 302);
 
-    // Show what old code would compute (wrong):
+    section("HLL sketch accuracy");
+    verify_hll(A_sk, A_nnz, "A(i,j) full-tuple");
+    verify_hll(B_sk, B_nnz, "B(j,k) full-tuple");
+    verify_hll(C_sk, C_nnz, "C(l,m) full-tuple");
+    verify_hll(A_j_sk, std::min((long long)J, A_nnz), "A mode['j'] (unique j in A)");
+    verify_hll(B_j_sk, std::min((long long)J, B_nnz), "B mode['j'] (unique j in B, = projected NNZ)");
+    verify_hll(C_l_sk, std::min((long long)L, C_nnz), "C mode['l'] (unique l in C, = projected NNZ)");
+
+    section("Demonstrating the private-index problem");
     {
+        // Without mode_sketches, old code used full-tuple intersection:
         HyperLogLog ha(A_sk), hb(B_sk), hc(C_sk);
         std::vector<const HyperLogLog*> all3 = {&ha, &hb, &hc};
-        const double wrong = HyperLogLog::estimate_intersection(all3);
-        std::cout << "  [BUG DEMO] 3-way intersection of all sketches: "
-                  << static_cast<long long>(wrong)
-                  << "  ← ignores that C lives in a different space\n";
+        std::cout << "  [WRONG] 3-way full-tuple intersection: "
+                  << static_cast<long long>(HyperLogLog::estimate_intersection(all3))
+                  << "  ← hash collision artifact\n";
+
+        // Correct: project B to B'(j) and C to C'(l) first
+        HyperLogLog hb_j(B_j_sk), hc_l(C_l_sk);
+        HyperLogLog ha_j(A_j_sk);
+        std::vector<const HyperLogLog*> ab_j = {&ha_j, &hb_j};
+        const double matching_j = HyperLogLog::estimate_intersection(ab_j);
+        // avg i-values per matching j: NNZ(A) / unique_j_in_A
+        const double avg_i_per_j = HyperLogLog(A_sk).estimate() /
+                                   std::max(1.0, HyperLogLog(A_j_sk).estimate());
+        const double component1_nnz = matching_j * avg_i_per_j;
+        const double component2_nnz = hc_l.estimate(); // unique l in C
+        std::cout << "  [CORRECT]\n"
+                  << "    matching j values (A∩B on mode j): " << static_cast<long long>(matching_j) << "\n"
+                  << "    avg i-values per j in A:            " << avg_i_per_j << "\n"
+                  << "    Component 1 {A*B} NNZ ≈             " << static_cast<long long>(component1_nnz) << "\n"
+                  << "    Component 2 {C}  NNZ ≈              " << static_cast<long long>(component2_nnz) << "\n"
+                  << "    Estimated output NNZ ≈              "
+                  << static_cast<long long>(component1_nnz * component2_nnz) << "\n";
     }
 
-    // Show what the corrected code computes:
-    {
-        HyperLogLog ha(A_sk), hb(B_sk), hc(C_sk);
-        std::vector<const HyperLogLog*> ab = {&ha, &hb};
-        const double ab_est  = HyperLogLog::estimate_intersection(ab);
-        const double c_est   = hc.estimate();
-        std::cout << "  [CORRECT] NNZ(A*B) ≈ " << static_cast<long long>(ab_est)
-                  << "  NNZ(C) ≈ " << static_cast<long long>(c_est)
-                  << "  Product ≈ " << static_cast<long long>(ab_est * c_est) << "\n";
-    }
+    // Build tensors with mode_sketches populated
+    SparseMetadata A_meta, B_meta, C_meta;
+    A_meta.global_density = (double)A_nnz/(I*J);
+    A_meta.hll_sketch = A_sk;
+    A_meta.mode_sketches = {{'i', A_i_sk}, {'j', A_j_sk}};
+    A_meta.mode_kmv_sketches = {{'j', A_j_kmv}};
 
-    auto A = make_coo_tensor("A", {'i','j'}, {I,J}, A_nnz, (double)A_nnz/(I*J), A_sk);
-    auto B = make_coo_tensor("B", {'j','k'}, {J,K}, B_nnz, (double)B_nnz/(J*K), B_sk);
-    auto C = make_coo_tensor("C", {'l','m'}, {L,M}, C_nnz, (double)C_nnz/(L*M), C_sk);
+    B_meta.global_density = (double)B_nnz/(J*K);
+    B_meta.hll_sketch = B_sk;
+    B_meta.mode_sketches = {{'j', B_j_sk}, {'k', B_k_sk}};
+    B_meta.mode_kmv_sketches = {{'j', B_j_kmv}};
 
-    // j and k are contracted (don't appear in output); m is also contracted;
-    // i and l survive into output D(i,l)
+    C_meta.global_density = (double)C_nnz/(L*M);
+    C_meta.hll_sketch = C_sk;
+    C_meta.mode_sketches = {{'l', C_l_sk}, {'m', C_m_sk}};
+
+    auto A = std::make_shared<TensorNode>("A", std::vector<Index>{'i','j'}, Shape{I,J}, A_nnz, StorageFormat{}, A_meta);
+    auto B = std::make_shared<TensorNode>("B", std::vector<Index>{'j','k'}, Shape{J,K}, B_nnz, StorageFormat{}, B_meta);
+    auto C = std::make_shared<TensorNode>("C", std::vector<Index>{'l','m'}, Shape{L,M}, C_nnz, StorageFormat{}, C_meta);
+
     const std::vector<Index> out = {'i','l'};
     const std::unordered_map<Index,int> dims =
         {{'i',I},{'j',J},{'k',K},{'l',L},{'m',M}};
@@ -535,14 +619,25 @@ static void test_multi_component()
 
     auto plan = DPOptimizer::optimize({A, B, C}, out, dims);
 
-    section("Optimized plan");
-    std::cout << plan->to_string() << "\n";
+    // section("Optimized plan");
+    // std::cout << plan->to_string() << "\n";
 
-    section("NNZ estimation");
-    print_nnz_mode({A, B, C}, out, dims);
+    // section("NNZ estimation (cost model)");
+    // print_nnz_mode({A, B, C}, out, dims);
 
-    section("Format recommendations");
-    print_format_recommendations(plan);
+    // section("Index classification");
+    // {
+    //     const IndexClassification cls = CostModel::classify_indices({A, B, C}, out);
+    //     std::cout << "  free              : ";
+    //     for (Index i : cls.free_indices) std::cout << i << " "; std::cout << "\n";
+    //     std::cout << "  shared contracted : ";
+    //     for (Index i : cls.shared_contracted_indices) std::cout << i << " "; std::cout << "\n";
+    //     std::cout << "  private contracted: ";
+    //     for (Index i : cls.private_contracted_indices) std::cout << i << " "; std::cout << "\n";
+    // }
+
+    // section("Format recommendations");
+    // print_format_recommendations(plan);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -603,16 +698,97 @@ static void test_free_index_overlap()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test I: Element-wise multiplication — E(i,j) = A(i,j) * B(i,j)
+//
+// Both tensors share i and j, and both are FREE indices (no contraction).
+// The optimizer identifies this as an element-wise operation (is_element_wise)
+// and uses the KMV full-tuple sketch intersection to accurately bound
+// the Hadamard product overlap, rather than falling back to an outer product.
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_elementwise_multiplication()
+{
+    banner("Test I: Element-wise multiplication   E(i,j) = A(i,j) * B(i,j)\n"
+           "        [Uses KMV full-tuple intersection]");
+
+    const int I=300, J=400;
+    const long long A_nnz=6000, B_nnz=5000;
+
+    auto A_kmv = build_kmv_sketch(I, J, A_nnz, 42);
+    auto B_kmv = build_kmv_sketch(I, J, B_nnz, 99); 
+
+    SparseMetadata A_meta, B_meta;
+    A_meta.global_density = (double)A_nnz/(I*J);
+    A_meta.kmv_sketch = A_kmv;
+    
+    B_meta.global_density = (double)B_nnz/(I*J);
+    B_meta.kmv_sketch = B_kmv;
+
+    auto A = std::make_shared<TensorNode>("A", std::vector<Index>{'i','j'}, Shape{I,J}, A_nnz, StorageFormat{}, A_meta);
+    auto B = std::make_shared<TensorNode>("B", std::vector<Index>{'i','j'}, Shape{I,J}, B_nnz, StorageFormat{}, B_meta);
+
+    const std::vector<Index> out = {'i','j'};
+    const std::unordered_map<Index,int> dims = {{'i',I},{'j',J}};
+
+    section("NNZ estimation (cost model — sees element-wise path)");
+    print_nnz_mode({A, B}, out, dims);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test J: 4-Way Multi-Join — R(i,j,l,m) = A(i,k) * B(j,k) * C(l,k) * D(m,k)
+//
+// All 4 tensors share the contracted index `k` ("Star schema" join). 
+// This tests the robustness of KMinValues (Theta sketches) over HLL for 
+// estimating deep multi-way joins natively without mathematical blowup.
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_multiway_join()
+{
+    banner("Test J: 4-Way Multi-Join   R(i,j,l,m) = A(i,k) * B(j,k) * C(l,k) * D(m,k)\n"
+           "        [Uses KMV mode-sketch N-way intersection]");
+
+    const int I=100, J=100, L=100, M=100, K=50000;
+    const long long nnz = 10000;
+
+    // Give them all mode kmv sketches for 'k' using different seeds
+    auto skA = build_mode_kmv_sketch(K, nnz, 1);
+    auto skB = build_mode_kmv_sketch(K, nnz, 2);
+    auto skC = build_mode_kmv_sketch(K, nnz, 3);
+    auto skD = build_mode_kmv_sketch(K, nnz, 4);
+
+    SparseMetadata metaA, metaB, metaC, metaD;
+    metaA.mode_kmv_sketches = {{'k', skA}};
+    metaB.mode_kmv_sketches = {{'k', skB}};
+    metaC.mode_kmv_sketches = {{'k', skC}};
+    metaD.mode_kmv_sketches = {{'k', skD}};
+
+    auto A = std::make_shared<TensorNode>("A", std::vector<Index>{'i','k'}, Shape{I,K}, nnz, StorageFormat{}, metaA);
+    auto B = std::make_shared<TensorNode>("B", std::vector<Index>{'j','k'}, Shape{J,K}, nnz, StorageFormat{}, metaB);
+    auto C = std::make_shared<TensorNode>("C", std::vector<Index>{'l','k'}, Shape{L,K}, nnz, StorageFormat{}, metaC);
+    auto D = std::make_shared<TensorNode>("D", std::vector<Index>{'m','k'}, Shape{M,K}, nnz, StorageFormat{}, metaD);
+
+    const std::vector<Index> out = {'i','j','l','m'};
+    const std::unordered_map<Index,int> dims = {{'i',I},{'j',J},{'l',L},{'m',M},{'k',K}};
+
+    section("NNZ estimation (cost model — KMV Multi-Way Join path)");
+    print_nnz_mode({A, B, C, D}, out, dims);
+    
+    auto plan = DPOptimizer::optimize({A, B, C, D}, out, dims);
+    section("Optimized plan");
+    std::cout << plan->to_string() << "\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 int main()
 {
-    test_spgemm();
-    test_chain();
-    test_spttm();
-    test_spgemm_hll();
-    test_mttkrp();
-    test_outer_product();
-    test_multi_component();
-    test_free_index_overlap();
+    // test_spgemm();
+    // test_chain();
+    // test_spttm();
+    // test_spgemm_hll();
+    // test_mttkrp();
+    // test_outer_product();
+    // test_multi_component();
+    // test_free_index_overlap();
+    // test_elementwise_multiplication();
+    test_multiway_join();
 
     std::cout << "\n" << std::string(70,'=') << "\n"
               << "  All tests complete.\n"

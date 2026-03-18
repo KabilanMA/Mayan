@@ -12,6 +12,8 @@
 #include <numeric>
 #include <functional>
 
+#include "util.h"
+
 
 // FREE: appears in the output; forms the outer loop nest
 // CONTRACTED: summed over; forms the inner loop nest; not in the output
@@ -20,7 +22,26 @@ enum class IndexRole { FREE, CONTRACTED };
 
 struct IndexClassification {
     std::vector<Index> free_indices;        // must appear in output
+
+    // Shared contracted: appear in 2 or more operands.
+    // These drive inter-tensor joins — they ARE the edges in the contraction graph.
+    // Example: j in A(i,j)*B(j,k) — j connects A and B.
+    std::vector<Index> shared_contracted_indices;
+
+    // Private contracted: appear in exactly 1 operand AND not in the output.
+    // These are self-reductions: the tensor sums out that index internally
+    // before any inter-tensor join takes place.
+    // Example: k in A(i,j)*B(j,k) → B self-reduces to B'(j)=Σ_k B(j,k).
+    //          The effective NNZ of B for join purposes is |unique j in B|,
+    //          NOT NNZ(B).
+    std::vector<Index> private_contracted_indices;
+
+    // All contracted (= shared_contracted ∪ private_contracted)
     std::vector<Index> contracted_indices;  // eliminated by this kernel
+
+    // I believe this would be = free_indices ∪ contracted_indices
+    // remove this later, if that's the case.
+    std::vector<Index> all_indices;
 };
 
 // NnzEstimationMode - records which path estimate_output_nnz actually took.
@@ -229,24 +250,37 @@ public:
     {
         const std::unordered_set<Index> out_set(output_indices.begin(), output_indices.end());
 
-        std::unordered_set<Index> all_set;
+        // count how many operands contain each index
+        std::unordered_map<Index, int> index_operand_count;
         for (const auto& op : operands) {
-            for (Index idx : op->get_indices()) 
-                all_set.insert(idx);
+            // Use a local set to avoid counting the same index twice per operand
+            std::unordered_set<Index> seen;
+            for (Index idx : op->get_indices()) {
+                if (seen.insert(idx).second) {
+                    index_operand_count[idx]++;
+                }
+            }
         }
 
         IndexClassification result;
-        for (Index idx : all_set) {
+        for (const auto& [idx, count] : index_operand_count) {
             if (out_set.count(idx)) {
                 result.free_indices.push_back(idx);
             } else {
                 result.contracted_indices.push_back(idx);
+                if (count >= 2) {
+                    result.shared_contracted_indices.push_back(idx);
+                } else {
+                    result.private_contracted_indices.push_back(idx);
+                }
             }
         }
 
         // Stable canonical order for reproducibility
         std::sort(result.free_indices.begin(), result.free_indices.end());
         std::sort(result.contracted_indices.begin(), result.contracted_indices.end());
+        std::sort(result.shared_contracted_indices.begin(), result.shared_contracted_indices.end());
+        std::sort(result.private_contracted_indices.begin(), result.private_contracted_indices.end());
         return result;
     }
 
@@ -292,7 +326,11 @@ private:
     {
         // Attempt HLL path
         if (all_have_hll_sketches(operands)) {
-            return estimate_nnz_via_hll(operands, idx_class, mode_out);
+            if (operands.size() == 1) {
+                mode_out = NnzEstimationMode::OUTER_PRODUCT;
+                return std::max(1.0, operands[0]->estimate_nnz());
+            } 
+            return estimate_nnz_via_hll(operands, idx_class, dim_sizes, mode_out);
         }
         mode_out = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
         // Fallback density-product path
@@ -302,150 +340,241 @@ private:
     static bool all_have_hll_sketches(const std::vector<std::shared_ptr<ExprNode>>& operands)
     {
         for (const auto& op : operands) {
-            if (op->metadata.hll_sketch.empty()) 
+            bool has_full_sketch = !op->metadata.hll_sketch.empty() || !op->metadata.kmv_sketch.empty();
+
+            bool has_all_mode_sketches = true;
+            for (Index idx : op->get_indices()) {
+                if (op->metadata.mode_sketches.find(idx) == op->metadata.mode_sketches.end() &&
+                    op->metadata.mode_kmv_sketches.find(idx) == op->metadata.mode_kmv_sketches.end()) {
+                    has_all_mode_sketches = false;
+                    break;
+                }
+            }
+
+            if (!has_full_sketch && !has_all_mode_sketches) {
                 return false;
+            }
         }
         return true;
     }
 
-        // =========================================================================
-    // estimate_nnz_via_hll — the corrected HLL path
-    //
-    // WHY THE OLD CODE WAS WRONG
-    // ──────────────────────────
-    // Each tensor's HLL sketch hashes its *full coordinate tuple*.
-    // B(i,k) hashes (i,k) pairs  →  lives in coordinate space ℤᵢ × ℤₖ
-    // C(k,j) hashes (k,j) pairs  →  lives in coordinate space ℤₖ × ℤⱼ
-    //
-    // Calling estimate_intersection(B_sketch, C_sketch) computes |B ∩ C| in
-    // the *hash* space.  Because B and C live in DIFFERENT coordinate spaces,
-    // this intersection has no mathematical meaning — it returns a small number
-    // by random hash collision, not by actual sparsity structure.
-    //
-    // THE THREE CASES AND THEIR CORRECT FORMULAS
-    // ──────────────────────────────────────────
-    //
-    // Case 1 — No contracted indices (pure outer product):
-    //   A(i,j) ⊗ B(k,l) → C(i,j,k,l)
-    //   Every NNZ of A paired with every NNZ of B produces a NNZ in C.
-    //   Output NNZ = Π NNZ(operandᵢ)
-    //   Intersection is completely wrong here.
-    //
-    // Case 2 — Single connected component:
-    //   B(i,k) * C(k,j) → A(i,j)   [k is contracted, connects B and C]
-    //   Both operands share contracted index k.  Their sketches are built
-    //   over the same k-coordinate domain, making intersection a reasonable
-    //   proxy.  We apply HLL intersection to the whole group.
-    //
-    // Case 3 — Multiple connected components:
-    //   A(i,j) * B(k,l) * C(j,k) → D(i,l)
-    //   Contraction graph: A──C──B (j connects A-C, k connects C-B).
-    //   A, B, C are all connected → single component here.
-    //   But consider: A(i,j) * B(j,k) * C(l,m) → D(i,k,l,m)
-    //   Graph: A──B   C  (C is isolated; j is contracted, l and m are free)
-    //   Component 1: {A, B} → intersection estimate
-    //   Component 2: {C}    → C's own NNZ
-    //   Output NNZ = NNZ(A*B) × NNZ(C)   [Cartesian product across components]
-    //
-    // BUILDING THE CONTRACTION GRAPH
-    // ──────────────────────────────
-    // Nodes  = operands (indices 0..N-1)
-    // Edge(i,j) iff operands i and j share ≥1 contracted index.
-    // Connected components are found via union-find.
+    // Helper to check if the computation is purely element-wise across all operands.
+    // We sort the indices to ensure A(i,j) and B(j,i) are correctly recognized as 
+    // sharing the exact same coordinate domain.
+    static bool is_element_wise(const std::vector<std::shared_ptr<ExprNode>>& operands)
+    {
+        if (operands.size() <= 1) return true;
+
+        std::vector<Index> base_indices = operands[0]->get_indices();
+        std::sort(base_indices.begin(), base_indices.end());
+
+        for (size_t i = 1; i < operands.size(); ++i) {
+            std::vector<Index> curr_indices = operands[i]->get_indices();
+            std::sort(curr_indices.begin(), curr_indices.end());
+            if (base_indices != curr_indices) return false;
+        }
+        return true;
+    }
+
     // =========================================================================
-    /**
-     * @brief     // HLL-based estimation:
-    // The expected output NNZ = intersection_cardinality(contracted dims) ×
-    //                           product_of_free_dim_densities
+    // estimate_nnz_via_hll — corrected HLL path with private-index projection
     //
-    // In practice we estimate:
-    //   nnz ≈ min( Π |op_i| ,  Σ|op_i| ) bounded by output volume
+    // PRIVATE CONTRACTED INDEX PROBLEM (the bug this revision fixes)
+    // ──────────────────────────────────────────────────────────────
+    // Consider D(i,l) = A(i,j) * B(j,k) * C(l,m).
+    //   j : shared contracted  — connects A and B (join edge)
+    //   k : private contracted — appears only in B (self-reduction of B)
+    //   m : private contracted — appears only in C (self-reduction of C)
     //
-    // The n-way intersection of the HLL sketches gives a sharper lower-bound
-    // than the raw min() used in earlier versions.
-     */
+    // Mathematically:
+    //   D(i,l) = Σ_j [ A(i,j) · B'(j) ]  ·  C'(l)
+    //   where B'(j) = Σ_k B(j,k)
+    //         C'(l) = Σ_m C(l,m)
+    //
+    // B'(j) has NNZ = |unique j values in B|, NOT NNZ(B).
+    // If B is 1000×500 with 5000 NNZ, unique j values ≈ 500 (most rows touched).
+    // But NNZ(B) = 5000 — 10× too large.  Using NNZ(B) in the intersection
+    // inflates the estimated output NNZ of the A*B join by up to that factor.
+    //
+    // THE FIX: projected_nnz(operand, private_indices, dim_sizes)
+    // ────────────────────────────────────────────────────────────
+    // Before feeding an operand into the intersection, project it onto the
+    // dimensions that survive the self-reduction (= all its indices minus its
+    // private contracted ones).
+    //
+    // Projection cardinality is estimated by THREE methods in priority order:
+    //
+    //   1. mode_sketches[idx]  — if a per-mode HLL sketch was built at load time,
+    //      use it.  This is the most accurate: it directly counts distinct values
+    //      along that dimension.
+    //
+    //   2. Birthday-problem formula (if dim_sizes available):
+    //      E[unique values] = D * (1 - exp(-NNZ / D))
+    //      where D = dimension size.  This correctly models how a random
+    //      scattering of NNZ entries covers a D-valued dimension.
+    //
+    //   3. Density fallback:
+    //      projected_nnz ≈ NNZ(op) / Π dim_size[private_idx]
+    //      Assumes the private dimensions are uniformly occupied.
+    //      Least accurate but requires no extra metadata.
+    // =========================================================================
     static double estimate_nnz_via_hll(
         const std::vector<std::shared_ptr<ExprNode>>& operands,
         const IndexClassification& idx_class,
+        const std::unordered_map<Index, int>& dim_sizes,
         NnzEstimationMode& mode_out)
     {
         const int N = static_cast<int>(operands.size());
+        assert(N > 1);
 
-        // ── Case 1: no contracted indices -> pure outer product ─────────────────
+        // hll can be used in N-way tensors using the hll_sketch only when the tensor operation is element-wise, otherwise we need to use the mode-sketches for estimation.
+
+        // Use hll_sketch of the operands if it is element wise
+        if (operands.size() > 1 && is_element_wise(operands)) {
+            // 1. Try KMV sketches first (Best for Multi-Way Intersections)
+            bool has_all_full_kmv = true;
+            std::vector<KMinValues> kmvs;
+            kmvs.reserve(N);
+            for (const auto& op : operands) {
+                if (op->metadata.kmv_sketch.empty()) {
+                    has_all_full_kmv = false;
+                    break;
+                }
+                kmvs.emplace_back(op->metadata.kmv_sketch);
+            }
+
+            if (has_all_full_kmv && !kmvs.empty()) {
+                std::vector<const KMinValues*> ptrs;
+                ptrs.reserve(kmvs.size());
+                for (const auto& k : kmvs) {
+                    ptrs.push_back(&k);
+                }
+                mode_out = NnzEstimationMode::HLL_SINGLE_COMPONENT;
+                return std::max(1.0, KMinValues::estimate_intersection(ptrs));
+            }
+
+            // 2. Fallback to HLL sketches
+            bool has_all_full_hll = true;
+            std::vector<HyperLogLog> hlls;
+            hlls.reserve(N);
+            for (const auto& op : operands) {
+                if (op->metadata.hll_sketch.empty()) {
+                    has_all_full_hll = false;
+                    break;
+                }
+                hlls.emplace_back(op->metadata.hll_sketch);
+            }
+
+            if (has_all_full_hll && !hlls.empty()) {
+                std::vector<const HyperLogLog*> ptrs;
+                ptrs.reserve(hlls.size());
+                for (const auto& h : hlls) {
+                    ptrs.push_back(&h);
+                }
+                mode_out = NnzEstimationMode::HLL_SINGLE_COMPONENT;
+                return std::max(1.0, HyperLogLog::estimate_intersection(ptrs));
+            }
+
+            // 3. Fallback if full sketches are missing: bound by min operand NNZ
+            // Prevents element-wise from hitting "Outer Product" and exploding estimated NNZ.
+            mode_out = NnzEstimationMode::DENSITY_PRODUCT_FALLBACK;
+            double min_nnz = std::numeric_limits<double>::max();
+            for (const auto& op : operands) {
+                min_nnz = std::min(min_nnz, op->estimate_nnz());
+            }
+            return std::max(1.0, min_nnz);
+        }
+
+        // Case 1: no contracted indices -> pure outer product
         if (idx_class.contracted_indices.empty()) {
             mode_out = NnzEstimationMode::OUTER_PRODUCT;
             double product = 1.0;
-            for (const auto& op : operands) product *= op->estimate_nnz();
+            for (const auto& op : operands) 
+                product *= op->estimate_nnz();
             return std::max(1.0, product);
         }
 
-        // ── Build contraction graph ────────────────────────────────────────────
-        // For each operand, collect which contracted indices it owns.
-        const std::unordered_set<Index> contracted_set(
-            idx_class.contracted_indices.begin(),
-            idx_class.contracted_indices.end());
+        // Build contraction graph
+        // Build per-operand set of private contracted indices
+        const std::unordered_set<Index> private_set(idx_class.private_contracted_indices.begin(), idx_class.private_contracted_indices.end());
 
+        const std::unordered_set<Index> contracted_set(idx_class.contracted_indices.begin(), idx_class.contracted_indices.end());
+
+        // For each operand: which of its indices are private contracted?
+        std::vector<std::unordered_set<Index>> op_private(N);
         std::vector<std::unordered_set<Index>> op_contracted(N);
         for (int i = 0; i < N; ++i) {
             for (Index idx : operands[i]->get_indices()) {
-                if (contracted_set.count(idx)) op_contracted[i].insert(idx);
+                if (private_set.count(idx))
+                    op_private[i].insert(idx);
+                if (contracted_set.count(idx)) 
+                    op_contracted[i].insert(idx);
             }
         }
 
-        // Union-find
+        // ── Build contraction graph (edges on SHARED contracted indices only) ──
         std::vector<int> parent(N);
         std::iota(parent.begin(), parent.end(), 0);
         std::function<int(int)> find = [&](int x) -> int {
             return parent[x] == x ? x : parent[x] = find(parent[x]);
         };
+        
         auto unite = [&](int a, int b) {
-            a = find(a); b = find(b);
-            if (a != b) parent[a] = b;
+            a = find(a); 
+            b = find(b);
+            if (a != b) 
+                parent[a] = b;
         };
 
-        // Connect operands that share a contracted index.
-        // NOTE: operands that are only connected through FREE indices are NOT
-        // joined here — free indices don't create a join dependency; they just
-        // mean both tensors are iterated over in the same outer loop.
         for (int i = 0; i < N; ++i) {
             for (int j = i + 1; j < N; ++j) {
                 for (Index idx : op_contracted[i]) {
-                    if (op_contracted[j].count(idx)) { unite(i, j); break; }
+                    // Only shared contracted indices create join edges;
+                    // private contracted indices exist in only one operand
+                    // and cannot create edges between different operands.
+                    if (!private_set.count(idx) && op_contracted[j].count(idx)) {
+                        unite(i, j);
+                        break;
+                    }
                 }
             }
         }
 
-        // Group operands by component root
         std::unordered_map<int, std::vector<int>> components;
-        for (int i = 0; i < N; ++i) components[find(i)].push_back(i);
+        for (int i = 0; i < N; ++i) {
+            int k = find(i);
+            components[k].push_back(i);
+        }
 
-        // ── Reconstruct sketches ───────────────────────────────────────────────
-        std::vector<HyperLogLog> sketches;
-        sketches.reserve(N);
-        for (const auto& op : operands) sketches.emplace_back(op->metadata.hll_sketch);
 
-        // ── Compute NNZ per component, multiply across components ──────────────
-        //
-        // Within a component: HLL intersection is valid because all operands
-        // share at least one contracted index — their coordinate spaces overlap
-        // in the k-dimension, making the intersection a useful order-of-magnitude
-        // proxy for the number of matching k-values.
-        //
-        // Across components: pure Cartesian product (different index spaces).
+        // ── Compute effective (projected) NNZ for each operand ─────────────────
+        // For an operand with private contracted indices, project it down to
+        // its non-private dimensions before using it in the intersection.
+        std::vector<double> effective_nnz(N);
+        for (int i = 0; i < N; ++i) {
+            effective_nnz[i] = projected_nnz(*operands[i], op_private[i], dim_sizes);
+        }
+
+        // ── NNZ per component, Cartesian product across components ─────────────
         double total_nnz = 1.0;
 
         for (const auto& [root, members] : components) {
             double component_nnz;
             if (static_cast<int>(members.size()) == 1) {
-                // Isolated operand: no contracted index shared with anyone else.
-                // Its full NNZ is its contribution to the outer product.
-                component_nnz = sketches[members[0]].estimate();
+                // Isolated operand: its projected NNZ is the full contribution
+                component_nnz = effective_nnz[members[0]];
             } else {
-                // Connected component: intersection estimate
-                std::vector<const HyperLogLog*> ptrs;
-                ptrs.reserve(members.size());
-                for (int idx : members) ptrs.push_back(&sketches[idx]);
-                component_nnz = HyperLogLog::estimate_intersection(ptrs);
+                // Connected component: use projected NNZ estimates for intersection.
+                // We can't feed full-tuple sketches into HLL intersection across
+                // different spaces, so we use effective_nnz and apply the
+                // min-cardinality bound: the join output cannot exceed the smallest
+                // projected operand in the group (under independence assumption).
+                //
+                // Better: if mode_sketches are available for the shared contracted
+                // index, use them for a proper HLL intersection on that dimension.
+                component_nnz = estimate_component_nnz(
+                    operands, members, op_contracted, private_set,
+                    effective_nnz, dim_sizes);
             }
             total_nnz *= std::max(1.0, component_nnz);
         }
@@ -455,6 +584,231 @@ private:
             : NnzEstimationMode::HLL_MULTI_COMPONENT;
 
         return std::max(1.0, total_nnz);
+    }
+
+    // =========================================================================
+    // projected_nnz — estimate NNZ after self-reducing private contracted indices
+    //
+    // Returns the estimated number of distinct non-private tuples in `op`.
+    // For B(j,k) with k private: returns |unique j values in B|.
+    // =========================================================================
+    static double projected_nnz(
+        const ExprNode& op,
+        const std::unordered_set<Index>& private_indices,
+        const std::unordered_map<Index, int>& dim_sizes)
+    {
+        if (private_indices.empty()) {
+            // No self-reduction needed: full NNZ is the effective NNZ
+            return op.estimate_nnz();
+        }
+
+        // Collect the surviving (non-private) indices of this operand
+        std::vector<Index> surviving;
+        for (Index idx : op.get_indices()) {
+            if (!private_indices.count(idx)) 
+                surviving.push_back(idx);
+        }
+
+        // ── Method 1a: per-mode KMV sketches (most accurate for multi-way) ───
+        bool all_mode_kmv = !surviving.empty();
+        for (Index idx : surviving) {
+            if (op.metadata.mode_kmv_sketches.find(idx) == op.metadata.mode_kmv_sketches.end()) {
+                all_mode_kmv = false;
+                break;
+            }
+        }
+
+        if (all_mode_kmv) {
+            if (surviving.size() == 1) {
+                KMinValues kmv(op.metadata.mode_kmv_sketches.at(surviving[0]));
+                return std::max(1.0, kmv.estimate());
+            } else {
+                double marginal_product = 1.0;
+                for (Index idx : surviving) {
+                    KMinValues kmv(op.metadata.mode_kmv_sketches.at(idx));
+                    marginal_product *= kmv.estimate();
+                }
+                return std::max(1.0, std::min(op.estimate_nnz(), marginal_product));
+            }
+        }
+
+        // ── Method 1b: per-mode HLL sketches ─────────────────────────────────
+        // If every surviving index has a mode_sketch, intersect them.
+        // mode_sketches[idx] hashes only the idx-coordinate of each NNZ,
+        // so it directly counts distinct idx values → projected cardinality.
+        bool all_mode_sketches = !surviving.empty();
+        for (Index idx : surviving) {
+            if (op.metadata.mode_sketches.find(idx) == op.metadata.mode_sketches.end()) {
+                all_mode_sketches = false;
+                break;
+            }
+        }
+
+        if (all_mode_sketches) {
+            if (surviving.size() == 1) {
+                // Single surviving index: its mode_sketch is the exact projection
+                HyperLogLog hll(op.metadata.mode_sketches.at(surviving[0]));
+                return std::max(1.0, hll.estimate());
+            } else {
+            // Multiple surviving indices: intersection is mathematically invalid here
+            // because different dimensions hash different coordinate domains.
+            // Instead, we estimate the joint tuples by multiplying the marginal cardinalities
+            // (assuming independence), clamped by the total NNZ of the tensor.
+            double marginal_product = 1.0;
+            for (Index idx : surviving) {
+                HyperLogLog hll(op.metadata.mode_sketches.at(idx));
+                marginal_product *= hll.estimate();
+            }
+            return std::max(1.0, std::min(op.estimate_nnz(), marginal_product));
+            }
+        }
+
+        // ── Method 2: birthday-problem formula (requires dim_sizes) ──────────
+        // E[unique values along surviving dimensions] = D*(1 - exp(-NNZ/D))
+        // where D = product of surviving dimension sizes.
+        //
+        // For B(j,k) with k private, NNZ=5000, dim_j=1000:
+        //   E[unique j] = 1000*(1 - exp(-5000/1000)) ≈ 1000*(1-0.0067) ≈ 993
+        // For B(j,k) with k private, NNZ=500, dim_j=1000:
+        //   E[unique j] = 1000*(1 - exp(-500/1000)) ≈ 1000*0.393 ≈ 393
+        double surviving_volume = 1.0;
+        bool have_all_dims = !surviving.empty();
+        for (Index idx : surviving) {
+            auto it = dim_sizes.find(idx);
+            if (it == dim_sizes.end()) { have_all_dims = false; break; }
+            surviving_volume *= static_cast<double>(it->second);
+        }
+
+        if (have_all_dims && surviving_volume > 0.0) {
+            const double raw_nnz = op.estimate_nnz();
+            const double E = surviving_volume *
+                             (1.0 - std::exp(-raw_nnz / surviving_volume));
+            return std::max(1.0, E);
+        }
+
+        // ── Method 3: density fallback ───────────────────────────────────────
+        // Divide total NNZ by estimated size of the private dimensions.
+        // Assumes private dimensions are uniformly covered.
+        double private_volume = 1.0;
+        for (Index idx : private_indices) {
+            auto it = dim_sizes.find(idx);
+            private_volume *= (it != dim_sizes.end())
+                ? static_cast<double>(it->second)
+                : std::max(1.0, std::sqrt(op.estimate_nnz())); // rough fallback
+        }
+        return std::max(1.0, op.estimate_nnz() / private_volume);
+    }
+
+    // =========================================================================
+    // estimate_component_nnz — NNZ estimate for a single connected component
+    //
+    // For operands connected through shared contracted indices, the output NNZ
+    // is bounded by the smallest projected cardinality in the group (because
+    // the join eliminates non-matching tuples).
+    //
+    // If mode_sketches are available for the shared contracted index, we do a
+    // proper HLL intersection on that dimension — this is more accurate than
+    // the min-cardinality bound and correctly handles unequal selectivities.
+    // =========================================================================
+    static double estimate_component_nnz(
+        const std::vector<std::shared_ptr<ExprNode>>& operands,
+        const std::vector<int>&                        members,
+        const std::vector<std::unordered_set<Index>>&  op_contracted,
+        const std::unordered_set<Index>&               private_set,
+        const std::vector<double>&                     effective_nnz,
+        const std::unordered_map<Index, int>&          dim_sizes)
+    {
+        // Collect shared contracted indices for this component
+        // (the indices that actually connect the operands in this component)
+        std::unordered_set<Index> shared_in_component;
+        for (int i : members) {
+            for (Index idx : op_contracted[i]) {
+                if (!private_set.count(idx)) shared_in_component.insert(idx);
+            }
+        }
+
+        // ── Try KMV Multi-Way Intersection on the shared contracted dimension ──
+        // KMV naturally supports N-way intersection much better than HLL.
+        for (Index shared_idx : shared_in_component) {
+            bool all_have_kmv_sketch = true;
+            for (int m : members) {
+                if (operands[m]->metadata.mode_kmv_sketches.find(shared_idx) ==
+                    operands[m]->metadata.mode_kmv_sketches.end()) {
+                    all_have_kmv_sketch = false;
+                    break;
+                }
+            }
+
+            if (all_have_kmv_sketch) {
+                std::vector<KMinValues> kmvs;
+                kmvs.reserve(members.size());
+                for (int m : members) {
+                    kmvs.emplace_back(operands[m]->metadata.mode_kmv_sketches.at(shared_idx));
+                }
+                std::vector<const KMinValues*> ptrs;
+                for (const auto& k : kmvs) ptrs.push_back(&k);
+
+                const double matching_k = KMinValues::estimate_intersection(ptrs);
+                double tuples_per_match = 1.0;
+                for (int m : members) {
+                    KMinValues kmv_m(operands[m]->metadata.mode_kmv_sketches.at(shared_idx));
+                    const double unique_k_m = std::max(1.0, kmv_m.estimate());
+                    tuples_per_match *= std::max(1.0, effective_nnz[m] / unique_k_m);
+                }
+                return std::max(1.0, matching_k * tuples_per_match);
+            }
+        }
+
+        // ── Try HLL intersection on the shared contracted dimension ──────────
+        // If every member has a mode_sketch for a shared contracted index,
+        // we can do a proper HLL intersection in that dimension's coordinate space.
+        for (Index shared_idx : shared_in_component) {
+            bool all_have_mode_sketch = true;
+            for (int m : members) {
+                if (operands[m]->metadata.mode_sketches.find(shared_idx) ==
+                    operands[m]->metadata.mode_sketches.end())
+                {
+                    all_have_mode_sketch = false;
+                    break;
+                }
+            }
+
+            if (all_have_mode_sketch) {
+                // Build HLL objects from mode sketches for this shared index
+                std::vector<HyperLogLog> hlls;
+                hlls.reserve(members.size());
+                for (int m : members) {
+                    hlls.emplace_back(
+                        operands[m]->metadata.mode_sketches.at(shared_idx));
+                }
+                std::vector<const HyperLogLog*> ptrs;
+                for (const auto& h : hlls) ptrs.push_back(&h);
+
+                // This intersection is mathematically valid: all mode_sketches
+                // for the same index hash the same coordinate domain (ℤₖ),
+                // so |intersect| = estimated matching k-values across all operands.
+                const double matching_k = HyperLogLog::estimate_intersection(ptrs);
+
+                // Output NNZ ≈ matching shared values × average output tuples per match.
+                // Under independence: avg tuples per match ≈ Π(effective_nnz[m] / unique_k_in_m)
+                double tuples_per_match = 1.0;
+                for (int m : members) {
+                    HyperLogLog hll_m(
+                        operands[m]->metadata.mode_sketches.at(shared_idx));
+                    const double unique_k_m = std::max(1.0, hll_m.estimate());
+                    // free indices per matching k value in this operand
+                    tuples_per_match *= std::max(1.0, effective_nnz[m] / unique_k_m);
+                }
+
+                return std::max(1.0, matching_k * tuples_per_match);
+            }
+        }
+
+        // ── Fallback: min of projected NNZs (min-cardinality join bound) ──────
+        // The join output cannot exceed the smallest projected operand.
+        double min_nnz = std::numeric_limits<double>::max();
+        for (int m : members) min_nnz = std::min(min_nnz, effective_nnz[m]);
+        return std::max(1.0, min_nnz);
     }
 
     // Density-product fallback:

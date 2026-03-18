@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <set>
 #include <cassert>
 
 // =============================================================================
@@ -124,22 +125,19 @@ public:
     [[nodiscard]] static double estimate_intersection(
         const std::vector<const HyperLogLog*>& sketches)
     {
-        if (sketches.empty()) return 0.0;
-        if (sketches.size() == 1) return sketches[0]->estimate();
+        if (sketches.empty()) 
+            return 0.0;
+        if (sketches.size() == 1) 
+            return sketches[0]->estimate();
 
-        // Accumulate union and sum of individual cardinalities
-        // Full inclusion-exclusion for N sets is 2^N; we use a cheaper but
-        // reasonable approximation: iterative pairwise min-clamp.
-        double result = sketches[0]->estimate();
-        HyperLogLog running_union = *sketches[0];
-
-        for (size_t i = 1; i < sketches.size(); ++i) {
-            const double card_i = sketches[i]->estimate();
-            const HyperLogLog new_union = running_union.merge_union(*sketches[i]);
-            const double union_est = new_union.estimate();
-            // |A ∩ B| ≈ |A| + |B| - |A ∪ B|
-            result = std::max(1.0, result + card_i - union_est);
-            running_union = new_union;
+        // The iterative inclusion-exclusion formula breaks down mathematically
+        // for N >= 3 because it improperly subtracts sets.
+        // Instead, we compute an upper bound using the minimum of pairwise 
+        // intersections, which safely and accurately bounds multi-way overlap.
+        double result = estimate_intersection(*sketches[0], *sketches[1]);
+        for (size_t i = 2; i < sketches.size(); ++i) {
+            double pairwise = estimate_intersection(*sketches[i - 1], *sketches[i]);
+            result = std::min(result, pairwise);
         }
         return result;
     }
@@ -155,6 +153,95 @@ public:
 
 private:
     std::vector<uint8_t> regs_;
+};
+
+// =============================================================================
+// K-Minimum Values (KMV / Theta Sketch)
+//
+// While HLL is superior for Unions and Cardinalities, KMV naturally supports
+// N-way Intersections without the severe inclusion-exclusion numerical errors
+// that plague HLL for N >= 3.
+// =============================================================================
+
+class KMinValues {
+public:
+    static constexpr size_t K = 256;
+
+    KMinValues() = default;
+
+    explicit KMinValues(const std::vector<uint64_t>& sketch) {
+        for (uint64_t h : sketch) {
+            hashes_.insert(h);
+            if (hashes_.size() > K) {
+                hashes_.erase(std::prev(hashes_.end()));
+            }
+        }
+    }
+
+    void add(uint64_t hash) {
+        hashes_.insert(hash);
+        if (hashes_.size() > K) {
+            hashes_.erase(std::prev(hashes_.end()));
+        }
+    }
+
+    [[nodiscard]] double estimate() const {
+        if (hashes_.empty()) return 0.0;
+        if (hashes_.size() < K) return static_cast<double>(hashes_.size());
+        
+        uint64_t theta = *hashes_.rbegin();
+        double max_hash = static_cast<double>(std::numeric_limits<uint64_t>::max());
+        return static_cast<double>(K - 1) * max_hash / static_cast<double>(theta);
+    }
+
+    [[nodiscard]] const std::set<uint64_t>& get_hashes() const { return hashes_; }
+
+    // Multi-way intersection using the Theta-sketch formulation.
+    // It scales the observed exact overlap count by the probability
+    // threshold (min_theta) of the space.
+    [[nodiscard]] static double estimate_intersection(
+        const std::vector<const KMinValues*>& sketches)
+    {
+        if (sketches.empty()) return 0.0;
+        if (sketches.size() == 1) return sketches[0]->estimate();
+
+        uint64_t min_theta = std::numeric_limits<uint64_t>::max();
+        for (const auto* sk : sketches) {
+            if (sk->get_hashes().empty()) return 0.0; // Intersecting with empty set is 0
+            if (sk->get_hashes().size() == K) {
+                min_theta = std::min(min_theta, *sk->get_hashes().rbegin());
+            }
+        }
+
+        int overlap_count = 0;
+        for (uint64_t h : sketches[0]->get_hashes()) {
+            if (h >= min_theta) break; // we only evaluate in the valid threshold space
+
+            bool in_all = true;
+            for (size_t i = 1; i < sketches.size(); ++i) {
+                if (sketches[i]->get_hashes().find(h) == sketches[i]->get_hashes().end()) {
+                    in_all = false;
+                    break;
+                }
+            }
+            if (in_all) overlap_count++;
+        }
+
+        if (min_theta == std::numeric_limits<uint64_t>::max()) {
+            return static_cast<double>(overlap_count); // Sets were fully exact, no scaling
+        }
+
+        double max_hash = static_cast<double>(std::numeric_limits<uint64_t>::max());
+        double p = static_cast<double>(min_theta) / max_hash;
+        return std::max(1.0, static_cast<double>(overlap_count) / p);
+    }
+
+    [[nodiscard]] std::vector<uint64_t> serialize() const {
+        return std::vector<uint64_t>(hashes_.begin(), hashes_.end());
+    }
+
+private:
+    std::set<uint64_t> hashes_;
 };
 
 // =============================================================================

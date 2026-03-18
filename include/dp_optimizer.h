@@ -102,7 +102,8 @@ public:
                 std::vector<std::shared_ptr<ExprNode>> subset_ops;
                 subset_ops.reserve(size);
                 for (int i = 0; i < N; ++i) {
-                    if (mask & (1 << i)) subset_ops.push_back(inputs[i]);
+                    if (mask & (1 << i)) 
+                        subset_ops.push_back(inputs[i]);
                 }
 
                 // Determine which indices this subset must output
@@ -111,6 +112,7 @@ public:
                 // ============================================================
                 // Strategy A: N-ary Fusion
                 // ============================================================
+                std::cout << "ASA\n";
                 evaluate_nary_fusion(dp[mask], subset_ops, subset_out, dim_sizes);
 
                 // ============================================================
