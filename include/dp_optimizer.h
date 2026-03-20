@@ -109,10 +109,11 @@ public:
                 // Determine which indices this subset must output
                 const std::vector<Index> subset_out = CostModel::infer_output_indices(subset_ops, inputs, global_out_indices);
 
+                // kPrintln(subset_out);
+
                 // ============================================================
                 // Strategy A: N-ary Fusion
                 // ============================================================
-                std::cout << "ASA\n";
                 evaluate_nary_fusion(dp[mask], subset_ops, subset_out, dim_sizes);
 
                 // ============================================================
