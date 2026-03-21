@@ -1,5 +1,31 @@
+#pragma once
+
 #include <iostream>
 #include <vector>
+#include <unordered_map>
+
+// ─── Debug Logger ────────────────────────────────────────────────────────────
+// Usage: mayan_debug("My variable is: " << my_var);
+// Enable by compiling with: g++ -DMAYAN_ENABLE_DEBUG ...
+#ifdef MAYAN_ENABLE_DEBUG
+#define mayan_debug(msg) do { std::cerr << "[DEBUG " << __FILE__ << ":" << __LINE__ << "] " << msg << std::endl; } while(0)
+#else
+#define mayan_debug(msg) do {} while(0)
+#endif
+
+// Generic stream insertion operator for std::vector
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const std::vector<T>& v) {
+    os << "[";
+    for (size_t i = 0; i < v.size(); ++i) {
+        os << v[i];
+        if (i < v.size() - 1) {
+            os << ", ";
+        }
+    }
+    os << "]";
+    return os;
+}
 
 template <typename Container>
 void kPrint(const Container& v) {

@@ -62,6 +62,10 @@ static void print_format_recommendations(const std::shared_ptr<ExprNode>& node,
         }
         return;
     }
+    if (auto u = std::dynamic_pointer_cast<UnaryOpNode>(node)) {
+        print_format_recommendations(u->operand, depth);
+        return;
+    }
     if (auto f = std::dynamic_pointer_cast<FusedContractionNode>(node)) {
         for (const auto& op : f->operands) {
             print_format_recommendations(op, depth + 1);
@@ -228,10 +232,17 @@ static void test_elementwise_multiplication()
     const std::vector<Index> out = {'i','j'};
     const std::unordered_map<Index,int> dims = {{'i',I},{'j',J}};
 
-    section("NNZ estimation (cost model — sees element-wise path)");
-    print_nnz_mode({A, B}, out, dims);
+    std::vector<std::shared_ptr<ExprNode>> inputs = {A, B};
 
-    auto plan = DPOptimizer::optimize({A, B}, out, dims);
+    // CanonicalizationPass pass(out, dims);
+    // for (auto& input : inputs) {
+    //     input = pass.mutate(input); 
+    // }
+
+    section("NNZ estimation (cost model — sees element-wise path)");
+    print_nnz_mode(inputs, out, dims);
+
+    auto plan = DPOptimizer::optimize(inputs, out, dims);
     section("Optimized plan");
     std::cout << plan->to_string() << "\n";
 }
@@ -376,6 +387,41 @@ static void test_broadcast_join()
     print_nnz_mode({A_no_sketch, B_no_sketch}, out, dims);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Test N: Diagonal Trace — A(i,j) = B(i,k,k) * C(j)
+//
+// Tests the AST canonicalization pass converting repeated indices into an
+// explicit TraceNode, shielding the CostModel from handling trace semantics.
+// ─────────────────────────────────────────────────────────────────────────────
+static void test_diagonal_trace()
+{
+    banner("Test N: Diagonal Trace   A(i,j) = B(i,k,k) * C(j)\n"
+           "        [Uses AST Canonicalization Pass]");
+
+    const int I=100, J=200, K=50;
+    const long long B_nnz = 5000, C_nnz = 150;
+
+    auto B = std::make_shared<TensorNode>("B", std::vector<Index>{'i','k','k'}, Shape{I,K,K}, B_nnz, StorageFormat{});
+    auto C = std::make_shared<TensorNode>("C", std::vector<Index>{'j'}, Shape{J}, C_nnz, StorageFormat{});
+
+    const std::vector<Index> out = {'i','j'};
+    const std::unordered_map<Index,int> dims = {{'i',I},{'j',J},{'k',K}};
+
+    std::vector<std::shared_ptr<ExprNode>> inputs = {B, C};
+
+    CanonicalizationPass pass(out, dims);
+    for (auto& input : inputs) {
+        input = pass.mutate(input); 
+    }
+
+    section("AST after Canonicalization (Passed to DP Optimizer)");
+    std::cout << "  " << inputs[0]->to_string() << "\n";
+    std::cout << "  " << inputs[1]->to_string() << "\n";
+
+    auto plan = DPOptimizer::optimize(inputs, out, dims);
+    section("Optimized plan");
+    std::cout << plan->to_string() << "\n";
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 int main()
@@ -385,6 +431,7 @@ int main()
     // test_pure_outer_product();
     // test_self_contraction();
     // test_broadcast_join();
+    // test_diagonal_trace();
 
     std::cout << "\n" << std::string(70,'=') << "\n"
               << "  All tests complete.\n"

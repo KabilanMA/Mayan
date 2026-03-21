@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 
 using Index = char;
@@ -81,6 +82,59 @@ struct ExprNode {
     SparseMetadata metadata;
 };
 
+// Stream insertion operator for shared_ptr<ExprNode>
+inline std::ostream& operator<<(std::ostream& os, const std::shared_ptr<ExprNode>& node) {
+    if (node) {
+        os << node->to_string();
+    } else {
+        os << "null";
+    }
+    return os;
+}
+
+// Base class for operations that act on a single tensor/expression
+struct UnaryOpNode : public ExprNode {
+    std::shared_ptr<ExprNode> operand;
+    
+    UnaryOpNode(std::shared_ptr<ExprNode> op) : operand(std::move(op)) {
+        if (operand) {
+            this->metadata = operand->metadata;
+        }
+    }
+};
+
+struct TraceNode : public UnaryOpNode {
+    Index trace_idx;
+    std::vector<Index> output_indices;
+    double cached_nnz;
+
+    TraceNode(std::shared_ptr<ExprNode> op, Index idx, std::vector<Index> out, double nnz)
+        : UnaryOpNode(std::move(op)), trace_idx(idx), output_indices(std::move(out)), cached_nnz(nnz) {}
+
+    std::vector<Index> get_indices() const override { return output_indices; }
+    double estimate_nnz() const override { return cached_nnz; }
+    
+    std::string to_string() const override {
+        return "Trace(" + std::string(1, trace_idx) + ", " + operand->to_string() + ")";
+    }
+};
+
+struct ReduceNode : public UnaryOpNode {
+    Index reduce_idx;
+    std::vector<Index> output_indices;
+    double cached_nnz;
+
+    ReduceNode(std::shared_ptr<ExprNode> op, Index idx, std::vector<Index> out, double nnz)
+        : UnaryOpNode(std::move(op)), reduce_idx(idx), output_indices(std::move(out)), cached_nnz(nnz) {}
+
+    std::vector<Index> get_indices() const override { return output_indices; }
+    double estimate_nnz() const override { return cached_nnz; }
+    
+    std::string to_string() const override {
+        return "Reduce(" + std::string(1, reduce_idx) + ", " + operand->to_string() + ")";
+    }
+};
+
 // ─── Leaf Node: Physical Tensor ───────────────────────────────────────────────
 //
 // `indices`      : the LOGICAL indices in the original einsum notation.
@@ -109,10 +163,8 @@ struct TensorNode : public ExprNode {
     std::string format_label; // "CSR" / "CSC" / "CSF[...]" — set post-optimization
     std::string rationale;    // why this format — set post-optimization
 
-    TensorNode(std::string n, std::vector<Index> idx, Shape s, double non_zeros,
-               StorageFormat fmt, SparseMetadata meta = {})
-        : name(std::move(n)), indices(std::move(idx)), shape(std::move(s)),
-          nnz(non_zeros), format(std::move(fmt))
+    TensorNode(std::string n, std::vector<Index> idx, Shape s, double non_zeros, StorageFormat fmt, SparseMetadata meta = {})
+        : name(std::move(n)), indices(std::move(idx)), shape(std::move(s)), nnz(non_zeros), format(std::move(fmt))
     {
         this->metadata = std::move(meta);
         // Default: format.mode_order should match `indices` for a fresh tensor.
@@ -179,10 +231,14 @@ struct FusedContractionNode : public ExprNode {
 
     FusedContractionNode(std::vector<std::shared_ptr<ExprNode>> ops,
                          std::vector<Index> out, double nnz,
-                         std::vector<Index> loop_order, StorageFormat out_fmt)
+                         std::vector<Index> loop_order, StorageFormat out_fmt,
+                         SparseMetadata meta = {})
         : operands(std::move(ops)), out_indices(std::move(out)),
           cached_nnz(nnz), loop_iteration_order(std::move(loop_order)),
-          output_format(std::move(out_fmt)) {}
+          output_format(std::move(out_fmt))
+    {
+        this->metadata = std::move(meta);
+    }
 
     std::vector<Index> get_indices() const override { 
         return out_indices; 
@@ -282,5 +338,84 @@ struct FusedContractionNode : public ExprNode {
 
         res += ")";
         return res;
+    }
+};
+
+class ASTRewriter {
+public:
+    virtual ~ASTRewriter() = default;
+
+    // Dispatcher
+    virtual std::shared_ptr<ExprNode> mutate(const std::shared_ptr<ExprNode>& node) {
+        if (auto t = std::dynamic_pointer_cast<TensorNode>(node)) {
+            return mutate_tensor(t);
+        } else if (auto u = std::dynamic_pointer_cast<UnaryOpNode>(node)) {
+            return mutate_unary(u);
+        } else if (auto f = std::dynamic_pointer_cast<FusedContractionNode>(node)) {
+            return mutate_fused(f);
+        }
+        return node; // Fallback
+    }
+
+protected:
+    virtual std::shared_ptr<ExprNode> mutate_tensor(std::shared_ptr<TensorNode> node) {
+        return node;
+    }
+
+    virtual std::shared_ptr<ExprNode> mutate_unary(std::shared_ptr<UnaryOpNode> node) {
+        node->operand = mutate(node->operand);
+        return node;
+    }
+
+    virtual std::shared_ptr<ExprNode> mutate_fused(std::shared_ptr<FusedContractionNode> node) {
+        for (auto& op : node->operands) {
+            op = mutate(op); // Recursively rewrite children
+        }
+        return node;
+    }
+};
+
+class CanonicalizationPass : public ASTRewriter {
+private:
+    std::unordered_set<Index> global_out;
+    std::unordered_map<Index, int> dim_sizes;
+
+public:
+    CanonicalizationPass(std::vector<Index> out, std::unordered_map<Index, int> dims)
+        : global_out(out.begin(), out.end()), dim_sizes(std::move(dims)) {}
+
+protected:
+    std::shared_ptr<ExprNode> mutate_tensor(std::shared_ptr<TensorNode> node) override {
+        auto current_node = std::dynamic_pointer_cast<ExprNode>(node);
+
+        // 1. Detect and handle Repeated Indices (Traces / Diagonals)
+        std::unordered_map<Index, int> counts;
+        for (Index idx : current_node->get_indices()) counts[idx]++;
+
+        for (auto [idx, count] : counts) {
+            if (count >= 2) {
+                // Determine remaining indices after taking the trace
+                std::vector<Index> new_indices;
+                for (Index i : current_node->get_indices()) {
+                    if (i != idx) new_indices.push_back(i);
+                }
+
+                // Estimate NNZ of the diagonal. 
+                // A rough heuristic: diagonal_nnz = total_nnz / dimension_size
+                double diag_nnz = current_node->estimate_nnz();
+                if (dim_sizes.count(idx)) {
+                    diag_nnz = std::max(1.0, diag_nnz / dim_sizes[idx]);
+                }
+
+                // Wrap it in a TraceNode
+                current_node = std::make_shared<TraceNode>(current_node, idx, new_indices, diag_nnz);
+            }
+        }
+
+        // 2. Future expansion: You could detect "private contracted" indices here 
+        //    if you pass down the index counts from the full expression,
+        //    and wrap them in a ReduceNode() instead of handling it inside CostModel.
+
+        return current_node;
     }
 };

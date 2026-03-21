@@ -194,7 +194,9 @@ public:
         return static_cast<double>(K - 1) * max_hash / static_cast<double>(theta);
     }
 
-    [[nodiscard]] const std::set<uint64_t>& get_hashes() const { return hashes_; }
+    [[nodiscard]] const std::set<uint64_t>& get_hashes() const { 
+        return hashes_; 
+    }
 
     // Multi-way intersection using the Theta-sketch formulation.
     // It scales the observed exact overlap count by the probability
@@ -202,12 +204,15 @@ public:
     [[nodiscard]] static double estimate_intersection(
         const std::vector<const KMinValues*>& sketches)
     {
-        if (sketches.empty()) return 0.0;
-        if (sketches.size() == 1) return sketches[0]->estimate();
+        if (sketches.empty()) 
+            return 0.0;
+        if (sketches.size() == 1) 
+            return sketches[0]->estimate();
 
         uint64_t min_theta = std::numeric_limits<uint64_t>::max();
         for (const auto* sk : sketches) {
-            if (sk->get_hashes().empty()) return 0.0; // Intersecting with empty set is 0
+            if (sk->get_hashes().empty()) 
+                return 0.0; // Intersecting with empty set is 0
             if (sk->get_hashes().size() == K) {
                 min_theta = std::min(min_theta, *sk->get_hashes().rbegin());
             }
@@ -215,7 +220,8 @@ public:
 
         int overlap_count = 0;
         for (uint64_t h : sketches[0]->get_hashes()) {
-            if (h >= min_theta) break; // we only evaluate in the valid threshold space
+            if (h >= min_theta) 
+                break; // we only evaluate in the valid threshold space
 
             bool in_all = true;
             for (size_t i = 1; i < sketches.size(); ++i) {
@@ -224,7 +230,8 @@ public:
                     break;
                 }
             }
-            if (in_all) overlap_count++;
+            if (in_all) 
+                overlap_count++;
         }
 
         if (min_theta == std::numeric_limits<uint64_t>::max()) {

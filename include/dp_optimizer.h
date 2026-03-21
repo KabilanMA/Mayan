@@ -119,14 +119,12 @@ public:
                 // ============================================================
                 // Strategy B: Binary Contraction Sequence
                 // ============================================================
-                evaluate_binary_splits(dp, mask, subset_out, dim_sizes, inputs,
-                                       global_out_indices);
+                // evaluate_binary_splits(dp, mask, subset_out, dim_sizes, inputs, global_out_indices);
 
                 // ============================================================
                 // Strategy C: Pivot Index Decomposition
                 // ============================================================
-                evaluate_pivot_decomposition(dp, mask, subset_ops, subset_out,
-                                             dim_sizes, inputs, global_out_indices);
+                // evaluate_pivot_decomposition(dp, mask, subset_ops, subset_out, dim_sizes, inputs, global_out_indices);
             }
         }
 
@@ -136,7 +134,7 @@ public:
         //    to carry the format recommended by its consuming kernel's loop order.
         //    This makes to_string() display the correct physical index order
         //    and enables code-gen to emit the right COO → CSF sort order.
-        return apply_recommended_formats(dp[num_subsets - 1].best_ast);
+        return apply_recommended_formats(dp[num_subsets - 1].best_ast, dim_sizes);
     }
 
 private:
@@ -313,7 +311,8 @@ private:
             out_indices,
             eval.estimated_out_nnz,
             eval.loop_order,
-            eval.out_format);
+            eval.out_format,
+            eval.metadata);
     }
 
     // =========================================================================
@@ -335,48 +334,50 @@ private:
     // =========================================================================
     static std::shared_ptr<ExprNode> apply_recommended_formats(
         const std::shared_ptr<ExprNode>& node,
-        const std::unordered_map<Index, int>& dim_sizes = {})
+        const std::unordered_map<Index, int>& dim_sizes = {},
+        const std::vector<Index>& parent_loop_order = {})
     {
-        // Leaf: format will be set when we process it in the context of its
-        // parent kernel. Return unchanged here — the parent handles it.
-        if (std::dynamic_pointer_cast<TensorNode>(node)) {
+        if (auto t = std::dynamic_pointer_cast<TensorNode>(node)) {
+            if (!parent_loop_order.empty()) {
+                auto rec = FormatSelector::recommend_for(
+                    *t, parent_loop_order, dim_sizes);
+
+                if (FormatSelector::needs_reformat(*t, rec.format.mode_order) ||
+                    t->format_label != rec.label)
+                {
+                    auto new_t = std::make_shared<TensorNode>(*t);
+                    new_t->format       = rec.format;
+                    new_t->format_label = rec.label;
+                    new_t->rationale    = rec.rationale;
+                    return new_t;
+                }
+            }
+            return node;
+        }
+
+        if (auto u = std::dynamic_pointer_cast<UnaryOpNode>(node)) {
+            auto rewritten = apply_recommended_formats(u->operand, dim_sizes, parent_loop_order);
+            if (rewritten != u->operand) {
+                if (auto trace = std::dynamic_pointer_cast<TraceNode>(node)) {
+                    return std::make_shared<TraceNode>(rewritten, trace->trace_idx, trace->output_indices, trace->cached_nnz);
+                } else if (auto reduce = std::dynamic_pointer_cast<ReduceNode>(node)) {
+                    return std::make_shared<ReduceNode>(rewritten, reduce->reduce_idx, reduce->output_indices, reduce->cached_nnz);
+                }
+            }
             return node;
         }
 
         auto fused = std::dynamic_pointer_cast<FusedContractionNode>(node);
         if (!fused) return node; // unknown node type; pass through
 
-        // Recursively rewrite each operand, then apply format to TensorNode leaves
         std::vector<std::shared_ptr<ExprNode>> new_operands;
         new_operands.reserve(fused->operands.size());
         bool any_changed = false;
 
         for (const auto& op : fused->operands) {
-            if (auto t = std::dynamic_pointer_cast<TensorNode>(op)) {
-                // Recommend the format this leaf needs for the current kernel
-                auto rec = FormatSelector::recommend_for(
-                    *t, fused->loop_iteration_order, dim_sizes);
-
-                if (FormatSelector::needs_reformat(*t, rec.format.mode_order) ||
-                    t->format_label != rec.label)
-                {
-                    // Copy-on-write: create a new TensorNode with updated format
-                    auto new_t = std::make_shared<TensorNode>(*t);
-                    new_t->format       = rec.format;
-                    new_t->format_label = rec.label;
-                    new_t->rationale    = rec.rationale;
-                    new_operands.push_back(new_t);
-                    any_changed = true;
-                } else {
-                    new_operands.push_back(op);
-                }
-            } else {
-                // Recurse into sub-trees (intermediates from binary splits
-                // or pivot decomposition)
-                auto rewritten = apply_recommended_formats(op, dim_sizes);
-                if (rewritten != op) any_changed = true;
-                new_operands.push_back(rewritten);
-            }
+            auto rewritten = apply_recommended_formats(op, dim_sizes, fused->loop_iteration_order);
+            if (rewritten != op) any_changed = true;
+            new_operands.push_back(rewritten);
         }
 
         if (!any_changed) return node;
@@ -387,7 +388,8 @@ private:
             fused->out_indices,
             fused->cached_nnz,
             fused->loop_iteration_order,
-            fused->output_format);
+            fused->output_format,
+            fused->metadata);
     }
 
 }; // class DPOptimizer

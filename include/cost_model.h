@@ -41,8 +41,8 @@ struct IndexClassification {
     // These indices are eliminated by the kernel's computation.
     std::vector<Index> contracted_indices;
 
-    // All unique indices involved in the kernel.
-    std::vector<Index> all_indices;
+    // // All unique indices involved in the kernel.
+    // std::vector<Index> all_indices;
 };
 
 // Records the estimation strategy used by `estimate_output_nnz`.
@@ -103,6 +103,10 @@ struct FusedCostResult {
     // Recommended input formats for each operand. For tensor leaves, this includes
     // any reformatting cost, which is incorporated into `total_cost`.
     std::vector<InputFormatRecommendation> input_formats;
+
+    // Approximated sketch metadata for the intermediate tensor produced by this
+    // fusion. This is crucial for enabling multi-level sketch-based estimation.
+    SparseMetadata metadata;
 };
 
 /**
@@ -170,7 +174,7 @@ public:
 
         double coo_conversion_cost = 0.0;
         for (size_t i = 0; i < operands.size(); ++i) {
-            if (auto t = std::dynamic_pointer_cast<TensorNode>(operands[i])) {
+            if (auto t = get_underlying_tensor(operands[i])) {
                 if (FormatSelector::needs_reformat(*t, input_formats[i].format.mode_order)) {
                     coo_conversion_cost += FormatSelector::conversion_cost(*t);
                 }
@@ -179,7 +183,18 @@ public:
 
         const double total_cost = breakdown.total_cost + coo_conversion_cost;
 
-        return {total_cost, estimated_out_nnz, loop_order, out_format, breakdown, std::move(input_formats)};
+        // --- Sketch Propagation for Intermediate ---
+        // For the DP optimizer to work across multiple levels, we must provide
+        // an estimated sketch for the intermediate tensor this fusion produces.
+        //
+        // NOTE: The previous naive propagation was flawed, as pointed out.
+        // A correct implementation needs to synthesize a new sketch based on
+        // the join, which is a complex problem. For now, we don't propagate
+        // sketches for intermediates. This limits the DP search depth but
+        // prevents incorrect estimations.
+        SparseMetadata intermediate_metadata;
+
+        return {total_cost, estimated_out_nnz, loop_order, out_format, breakdown, std::move(input_formats), std::move(intermediate_metadata)};
     }
 
     /**
@@ -245,6 +260,7 @@ public:
         return output;
     }
 
+    // DONE
     /**
      * @brief Classifies all indices in a set of operands as FREE, SHARED CONTRACTED,
      *        or PRIVATE CONTRACTED.
@@ -349,6 +365,7 @@ private:
         return false;
     }
 
+    // DONE
     /// @brief Checks if the operation is purely element-wise across all operands.
     /// This is true if all operands share the exact same set of indices.
     static bool is_element_wise(const std::vector<std::shared_ptr<ExprNode>>& operands)
@@ -400,12 +417,13 @@ private:
         // For element-wise operations, KMV is strongly preferred for its
         // accuracy in multi-way intersections.
 
-        // currently I am thinking supporting only Hadamard product, C(i,j)=A(i,j) * B(i,j). 
+        // currently I am thinking of supporting only Hadamard product, C(i,j)=A(i,j) * B(i,j). 
         // This acts as a logical AND filter where KMV is better. 
         // If in future, planning to support "Addition" between two tensors, 
-        // which will become a OR filter where one NN can produce a NN in the output.
+        // which will become a OR filter where one NN can produce a NN in the output (Then HLL for that too).
         if (is_element_wise(operands)) {
             // Try to use full-tensor KMV sketches if all operands have them.
+            // mayan_debug(operands);
             bool has_all_full_kmv = true;
             std::vector<KMinValues> kmvs;
             kmvs.reserve(N);
@@ -819,13 +837,21 @@ private:
                 // Estimate the number of matching coordinates on the shared index.
                 const double matching_k = KMinValues::estimate_intersection(ptrs);
                 
-                // Estimate the number of output tuples for each match.
+                // Estimate the number of output tuples for each match. Instead of a
+                // simple product of fanouts (which assumes independence and leads to
+                // overestimation), use the geometric mean to produce a more
+                // conservative estimate.
                 double tuples_per_match = 1.0;
-                for (int m : members) {
-                    KMinValues kmv_m(operands[m]->metadata.mode_kmv_sketches.at(shared_idx));
-                    const double unique_k_m = std::max(1.0, kmv_m.estimate());
-                    tuples_per_match *= std::max(1.0, effective_nnz[m] / unique_k_m);
+                if (!members.empty()) {
+                    double fanout_product = 1.0;
+                    for (int m : members) {
+                        KMinValues kmv_m(operands[m]->metadata.mode_kmv_sketches.at(shared_idx));
+                        const double unique_k_m = std::max(1.0, kmv_m.estimate());
+                        fanout_product *= std::max(1.0, effective_nnz[m] / unique_k_m);
+                    }
+                    tuples_per_match = std::pow(fanout_product, 1.0 / members.size());
                 }
+
                 return std::max(1.0, matching_k * tuples_per_match);
             }
         }
@@ -1232,6 +1258,23 @@ private:
         if (auto f = std::dynamic_pointer_cast<FusedContractionNode>(op)) {
             return f->output_format.mode_order;
         }
+        if (auto u = std::dynamic_pointer_cast<UnaryOpNode>(op)) {
+            std::vector<Index> inner_order = get_mode_order(u->operand);
+            std::vector<Index> valid_order;
+            std::unordered_set<Index> out_indices(u->get_indices().begin(), u->get_indices().end());
+            for (Index idx : inner_order) {
+                if (out_indices.count(idx)) {
+                    valid_order.push_back(idx);
+                }
+            }
+            return valid_order;
+        }
         return {};
+    }
+
+    static std::shared_ptr<TensorNode> get_underlying_tensor(const std::shared_ptr<ExprNode>& node) {
+        if (auto t = std::dynamic_pointer_cast<TensorNode>(node)) return t;
+        if (auto u = std::dynamic_pointer_cast<UnaryOpNode>(node)) return get_underlying_tensor(u->operand);
+        return nullptr;
     }
 };
